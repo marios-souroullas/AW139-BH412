@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flutter (cruise_input_screen.dart)",
+      "type": "dart",
+      "request": "launch",
+      "program": "lib/cruise_input_screen.dart",
+      "deviceId": "chrome"
+    }
+  ]
+}

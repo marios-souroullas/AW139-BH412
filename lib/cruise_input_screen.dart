@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-// add this next to your other imports
 import 'package:flutter/foundation.dart' show kIsWeb; // <-- add this
-// import 'dart:math' as math; // remove if unused
+import 'dart:convert';
+import 'dart:math' as math;
+import 'package:http/http.dart' as http;
+import 'package:geolocator/geolocator.dart';
 
 double _parseNumber(String s) {
   final t = s.trim().replaceAll(',', '.');
@@ -17,7 +18,9 @@ double _niceInterval(double maxY, {int targetTicks = 10}) {
   final raw = safe / targetTicks;
   final mags = [1, 2, 5, 10];
   double mag = 1;
-  while (mag < raw) mag *= 10;
+  while (mag < raw) {
+    mag *= 10;
+  }
   // pick the smallest “nice” step >= raw
   for (final m in mags) {
     final step = (mag / 10) * m;
@@ -132,6 +135,33 @@ Widget buildMiniBarChart({
   );
 }
 
+double _degToRad(double d) => d * math.pi / 180.0;
+double _radToDeg(double r) => r * 180.0 / math.pi;
+
+// Initial bearing from A(lat1,lon1) to B(lat2,lon2) in degrees (0–360)
+double _initialBearingDeg(double lat1, double lon1, double lat2, double lon2) {
+  final phi1 = _degToRad(lat1);
+  final phi2 = _degToRad(lat2);
+  final deltaLambda = _degToRad(lon2 - lon1);
+  final y = math.sin(deltaLambda) * math.cos(phi2);
+  final x =
+      math.cos(phi1) * math.sin(phi2) -
+      math.sin(phi1) * math.cos(phi2) * math.cos(deltaLambda);
+  final theta = math.atan2(y, x);
+  return ((_radToDeg(theta) + 360.0) % 360.0);
+}
+
+// Tailwind component along a course (positive tailwind, negative headwind)
+double _tailwindKts(
+  double windSpeedMps,
+  double windDirDegFrom,
+  double trackDeg,
+) {
+  final wsKts = windSpeedMps * 1.94384449;
+  final windTo = (windDirDegFrom + 180.0) % 360.0;
+  final diff = ((windTo - trackDeg + 540.0) % 360.0) - 180.0; // [-180,180]
+  return wsKts * math.cos(_degToRad(diff));
+}
 // ...existing code...
 // ...inside class _CruiseInputScreenState, right after } // closes calculateCruise()
 
@@ -150,6 +180,8 @@ void showCruiseResultsDialog({
   required double adjustedFuelBurn,
   required double hoistMinutesRounded,
   required double hoistFuel,
+  double? aiAltitudeFt, // NEW
+  double? aiTailwindKts, // NEW
 }) {
   final int fuelRemRounded = fuelRemaining.round();
 
@@ -207,6 +239,12 @@ void showCruiseResultsDialog({
                 Text(
                   'Fuel Burn Rate: ${adjustedFuelBurn.toStringAsFixed(1)} kg/hr',
                 ),
+                if (aiAltitudeFt != null && aiTailwindKts != null)
+                  Text(
+                    'AI: Suggested altitude ~${aiAltitudeFt!.toStringAsFixed(0)} ft '
+                    '(${aiTailwindKts!.toStringAsFixed(0)} kt tailwind)',
+                    style: const TextStyle(color: Colors.cyanAccent),
+                  ),
 
                 if (lowFuelWarning)
                   const Padding(
@@ -587,6 +625,37 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
   bool radar = false;
   bool flir = false;
   bool hoist = false;
+  // Winds Aloft toggles and inputs
+  bool useWindsAloft = false; // master on/off
+  bool standardWinds = true; // if true, assume 0 kt winds
+  bool useDeviceLocation = true; // origin from GPS; else manual
+  final originLatController = TextEditingController();
+  final originLonController = TextEditingController();
+  final destLatController = TextEditingController();
+  final destLonController = TextEditingController();
+
+  // AI suggestion outputs
+  double? _aiSuggestedAltitudeFt; // among 2000/4000/6000
+  double? _aiTailwindKts; // tailwind at suggested altitude
+
+  @override
+  void initState() {
+    super.initState();
+    // Existing initializations
+    cruiseSpeedController.text = cruiseSpeed.toString();
+    missionDistanceController.text = missionDistance.toString();
+    altitudeController.text = altitude.toString();
+    temperatureController.text = temperature.toString();
+    weightController.text = weight.toString();
+    fuelController.text = fuelOnboard.toString();
+    hoistTimeController.text = extraHoistMinutes.toString();
+
+    // Winds aloft controllers
+    originLatController.text = '';
+    originLonController.text = '';
+    destLatController.text = '';
+    destLonController.text = '';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -617,6 +686,39 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
                   buildInputField('Fuel Onboard (kg)', fuelController),
                   buildInputField('Hoist Time (min)', hoistTimeController),
                   const SizedBox(height: 16),
+                  // Winds Aloft controls
+                  SwitchListTile(
+                    title: const Text('Use Winds Aloft'),
+                    value: useWindsAloft,
+                    onChanged: (v) => setState(() => useWindsAloft = v),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  if (useWindsAloft) ...[
+                    SwitchListTile(
+                      title: const Text('Standard Winds (0 kt)'),
+                      value: standardWinds,
+                      onChanged: (v) => setState(() => standardWinds = v),
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                    SwitchListTile(
+                      title: const Text('Use device location for Origin'),
+                      value: useDeviceLocation,
+                      onChanged: (v) => setState(() => useDeviceLocation = v),
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                    if (!useDeviceLocation) ...[
+                      buildInputField('Origin Latitude', originLatController),
+                      buildInputField('Origin Longitude', originLonController),
+                    ],
+                    buildInputField(
+                      'Destination Latitude (optional)',
+                      destLatController,
+                    ),
+                    buildInputField(
+                      'Destination Longitude (optional)',
+                      destLonController,
+                    ),
+                  ],
                   buildEquipmentToggles(
                     context,
                     searchlight,
@@ -637,8 +739,8 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
                   ),
                   const SizedBox(height: 16),
                   ElevatedButton(
-                    onPressed: () {
-                      calculateCruise();
+                    onPressed: () async {
+                      await calculateCruise();
                     },
                     child: const Text('Calculate'),
                   ),
@@ -743,19 +845,7 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
     );
   }
 
-  @override
-  void initState() {
-    super.initState();
-    cruiseSpeedController.text = cruiseSpeed.toString();
-    missionDistanceController.text = missionDistance.toString();
-    altitudeController.text = altitude.toString();
-    temperatureController.text = temperature.toString();
-    weightController.text = weight.toString();
-    fuelController.text = fuelOnboard.toString();
-    hoistTimeController.text = extraHoistMinutes.toString();
-  }
-
-  void calculateCruise() {
+  Future<void> calculateCruise() async {
     cruiseSpeed = _parseNumber(cruiseSpeedController.text);
     missionDistance = _parseNumber(missionDistanceController.text);
     altitude = _parseNumber(altitudeController.text);
@@ -763,22 +853,20 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
     weight = _parseNumber(weightController.text);
     fuelOnboard = _parseNumber(fuelController.text);
     extraHoistMinutes = _parseNumber(hoistTimeController.text);
-    // Safety clamps
-    if (!cruiseSpeed.isFinite || cruiseSpeed <= 0) cruiseSpeed = 1; // avoid /0
+
+    if (!cruiseSpeed.isFinite || cruiseSpeed <= 0) cruiseSpeed = 1;
     if (!missionDistance.isFinite || missionDistance < 0) missionDistance = 0;
     if (!fuelOnboard.isFinite || fuelOnboard < 0) fuelOnboard = 0;
-    if (!extraHoistMinutes.isFinite || extraHoistMinutes < 0) {
+    if (!extraHoistMinutes.isFinite || extraHoistMinutes < 0)
       extraHoistMinutes = 0;
-    }
-    // Step 2: Correction factor from toggles
-    double cf = getCorrectionFactor(
+
+    // Equipment correction
+    final cf = getCorrectionFactor(
       searchlight: searchlight,
       radar: radar,
       flir: flir,
       hoist: hoist,
     );
-
-    // Step 3: Calculate cruise performance
     final perf = calculateCruisePerformance(
       distance: missionDistance,
       cruiseSpeed: cruiseSpeed,
@@ -787,33 +875,66 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
       roundTrip: true,
       cf: cf,
     );
+    // Winds aloft (optional)
+    double tailwind = 0.0; // + tailwind, - headwind
+    _aiSuggestedAltitudeFt = null;
+    _aiTailwindKts = null;
 
-    // Step 4: Endurance and range
-    double adjustedFuelBurn = perf['fuelBurnPerHour']!;
-    double endurance = fuelOnboard / adjustedFuelBurn;
-    double estimatedRange = cruiseSpeed * endurance;
-    double cruiseDuration = (missionDistance * 2) / cruiseSpeed;
-    double fuelForMission = adjustedFuelBurn * cruiseDuration;
-    // Hoist fuel calculation (rounded up to nearest 5 min block)
-    int hoistBlocks = (extraHoistMinutes / 5.0).ceil();
-    double hoistMinutesRounded = hoistBlocks * 5.0;
-    double hoistHours = hoistMinutesRounded / 60.0;
-    double hoistFuel = hoistHours * 450;
-    print('DEBUG: extraHoistMinutes=$extraHoistMinutes, hoistFuel=$hoistFuel');
+    if (useWindsAloft && !standardWinds) {
+      double? lat, lon;
+      if (useDeviceLocation) {
+        final pos = await _getCurrentPosition();
+        if (pos != null) {
+          lat = pos.latitude;
+          lon = pos.longitude;
+        }
+      }
+      lat ??= _parseNumber(originLatController.text);
+      lon ??= _parseNumber(originLonController.text);
 
-    // Subtract hoist fuel
-    double fuelRemainingAfterMission = fuelOnboard - fuelForMission - hoistFuel;
-    bool postMissionLowFuel = fuelRemainingAfterMission < 180;
-    double missionDuration = cruiseDuration + hoistHours;
+      final destLat = _parseNumber(destLatController.text);
+      final destLon = _parseNumber(destLonController.text);
 
-    // Update right-side charts (for the right panel)
+      if (lat.isFinite &&
+          lon.isFinite &&
+          destLat.isFinite &&
+          destLon.isFinite &&
+          (destLat != 0 || destLon != 0)) {
+        final trackDeg = _initialBearingDeg(lat, lon, destLat, destLon);
+        await _fetchAiAltitudeSuggestion(
+          lat: lat,
+          lon: lon,
+          trackDeg: trackDeg,
+        );
+        if (_aiTailwindKts != null) tailwind = _aiTailwindKts!;
+      }
+    }
+
+    // Round-trip timing (one-way d, then back)
+    final d = missionDistance;
+    final gsOut = (cruiseSpeed + tailwind).clamp(1.0, double.infinity);
+    final gsBack = (cruiseSpeed - tailwind).clamp(1.0, double.infinity);
+    final cruiseDuration = d / gsOut + d / gsBack;
+
+    final adjustedFuelBurn = perf['fuelBurnPerHour']!;
+    final endurance = fuelOnboard / adjustedFuelBurn;
+    final estimatedRange = cruiseSpeed * endurance;
+
+    // Hoist fuel (5-min blocks)
+    final hoistBlocks = (extraHoistMinutes / 5.0).ceil();
+    final hoistMinutesRounded = hoistBlocks * 5.0;
+    final hoistHours = hoistMinutesRounded / 60.0;
+    final hoistFuel = hoistHours * 450;
+
+    final fuelForMission = adjustedFuelBurn * cruiseDuration;
+    final fuelRemainingAfterMission = fuelOnboard - fuelForMission - hoistFuel;
+    final postMissionLowFuel = fuelRemainingAfterMission < 180;
+    final missionDuration = cruiseDuration + hoistHours;
     setState(() {
       _lastRequiredTorque = perf['recommendedTorque']!;
       _lastAdjustedFuelBurn = adjustedFuelBurn;
       _lastFuelRemaining = fuelRemainingAfterMission;
     });
-
-    // Show results dialog
     showCruiseResultsDialog(
       context: context,
       endurance: endurance,
@@ -824,13 +945,88 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
       lowFuelWarning: postMissionLowFuel,
       requiredTorque: perf['recommendedTorque']!,
       cruiseSpeed: cruiseSpeed,
-      altitude: altitude, // was altitude.toInt()
-      temperature: temperature, // was temperature.toInt()
+      altitude: altitude,
+      temperature: temperature,
       adjustedFuelBurn: adjustedFuelBurn,
       hoistMinutesRounded: hoistMinutesRounded,
       hoistFuel: hoistFuel,
+      aiAltitudeFt: _aiSuggestedAltitudeFt, // NEW
+      aiTailwindKts: _aiTailwindKts, // NEW
     );
-  } // <-- closes calculateCruise()
+  }
+  // ...inside class _CruiseInputScreenState, paste AFTER calculateCruise() and BEFORE buildMissionChart()
+
+  Future<bool> _ensureLocationPermission() async {
+    final enabled = await Geolocator.isLocationServiceEnabled();
+    if (!enabled) return false;
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    return perm == LocationPermission.always ||
+        perm == LocationPermission.whileInUse;
+  }
+
+  Future<Position?> _getCurrentPosition() async {
+    try {
+      if (!await _ensureLocationPermission()) return null;
+      return await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Fetch winds aloft and suggest best among 2000/4000/6000 ft (nearest levels)
+  Future<void> _fetchAiAltitudeSuggestion({
+    required double lat,
+    required double lon,
+    required double trackDeg,
+  }) async {
+    final uri = Uri.parse(
+      'https://api.open-meteo.com/v1/forecast'
+      '?latitude=$lat&longitude=$lon'
+      '&hourly=wind_speed_925hPa,wind_direction_925hPa,'
+      'wind_speed_850hPa,wind_direction_850hPa,'
+      'wind_speed_700hPa,wind_direction_700hPa'
+      '&forecast_days=1',
+    );
+    try {
+      final res = await http.get(uri);
+      if (res.statusCode != 200) return;
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      final h = data['hourly'] as Map<String, dynamic>;
+
+      final sp925 = (h['wind_speed_925hPa']?[0] ?? 0).toDouble(); // ~2500 ft
+      final dr925 = (h['wind_direction_925hPa']?[0] ?? 0).toDouble();
+      final sp850 = (h['wind_speed_850hPa']?[0] ?? 0).toDouble(); // ~5000 ft
+      final dr850 = (h['wind_direction_850hPa']?[0] ?? 0).toDouble();
+      final sp700 = (h['wind_speed_700hPa']?[0] ?? 0).toDouble(); // ~10000 ft
+      final dr700 = (h['wind_direction_700hPa']?[0] ?? 0).toDouble();
+
+      final tail925 = _tailwindKts(sp925, dr925, trackDeg);
+      final tail850 = _tailwindKts(sp850, dr850, trackDeg);
+      final tail700 = _tailwindKts(sp700, dr700, trackDeg);
+
+      // Map to 2000/4000/6000 ft by nearest pressure level
+      final candidates = <double, double>{
+        2000: tail925, // near 2500
+        4000: tail850, // near 5000
+        6000: tail850, // near 5000
+      };
+
+      final best = candidates.entries.reduce(
+        (a, b) => a.value >= b.value ? a : b,
+      );
+      setState(() {
+        _aiSuggestedAltitudeFt = best.key;
+        _aiTailwindKts = best.value;
+      });
+    } catch (_) {
+      // ignore network errors
+    }
+  }
 
   // Keep these as methods on the State class (outside calculateCruise)
   Widget buildMissionChart({

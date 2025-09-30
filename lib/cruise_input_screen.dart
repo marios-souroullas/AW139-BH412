@@ -1,11 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:aw139_cruise/export/cruise_report_export.dart'; // <-- add this line
 import 'package:flutter/foundation.dart' show kIsWeb; // <-- add this
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
+import 'dart:async';
 
+const Color kPanelColor = Color(0xFF2A2A2A);
 double _parseNumber(String s) {
   final t = s.trim().replaceAll(',', '.');
   return double.tryParse(t) ?? 0.0;
@@ -29,18 +34,25 @@ double _niceInterval(double maxY, {int targetTicks = 10}) {
   return mag; // fallback
 }
 
-Widget buildInputField(String label, TextEditingController controller) {
+Widget buildInputField(
+  String label,
+  TextEditingController controller, {
+  bool readOnly = false,
+}) {
   return Padding(
-    padding: const EdgeInsets.symmetric(vertical: 4),
+    padding: const EdgeInsets.symmetric(vertical: 6.0),
     child: TextField(
       controller: controller,
+      readOnly: readOnly,
+      keyboardType: TextInputType.number,
+      style: const TextStyle(color: Colors.white),
       decoration: InputDecoration(
         labelText: label,
         border: const OutlineInputBorder(),
-        isDense: true,
+        suffixIcon: readOnly
+            ? const Icon(Icons.lock, size: 16, color: Colors.orangeAccent)
+            : null,
       ),
-      keyboardType: TextInputType.number,
-      style: const TextStyle(color: Colors.white),
     ),
   );
 }
@@ -52,86 +64,100 @@ Widget buildMiniBarChart({
   required Color color,
   required double maxY,
   required String unit,
-  double height = 320, // taller charts
+  double height = 320,
 }) {
   final safeMaxY = (maxY.isFinite && maxY > 0) ? maxY : 100.0;
   final displayValue = (value.isFinite ? value : 0)
       .clamp(0, safeMaxY)
       .roundToDouble();
-  final interval = _niceInterval(safeMaxY, targetTicks: 10); // more labels
+  final interval = _niceInterval(safeMaxY, targetTicks: 10);
 
-  return SizedBox(
-    height: height,
-    width: double.infinity,
-    child: IgnorePointer(
-      ignoring: kIsWeb, // set to false if you want hover/tap tooltips
-      child: RepaintBoundary(
-        child: BarChart(
-          BarChartData(
-            minY: 0,
-            maxY: safeMaxY,
-            gridData: FlGridData(
-              show: true,
-              drawVerticalLine: false,
-              horizontalInterval: interval,
-            ),
-            titlesData: FlTitlesData(
-              topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-              rightTitles: AxisTitles(
-                sideTitles: SideTitles(showTitles: false),
-              ),
-              leftTitles: AxisTitles(
-                sideTitles: SideTitles(
-                  showTitles: true,
-                  interval: interval,
-                  reservedSize: 44,
-                  getTitlesWidget: (v, m) => Text(
-                    v.toInt().toString(),
-                    style: TextStyle(color: Colors.white, fontSize: 12),
-                  ),
+  return Column(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      SizedBox(
+        height: height,
+        width: double.infinity,
+        child: IgnorePointer(
+          ignoring: kIsWeb,
+          child: RepaintBoundary(
+            child: BarChart(
+              BarChartData(
+                minY: 0,
+                maxY: safeMaxY,
+                gridData: FlGridData(
+                  show: true,
+                  drawVerticalLine: false,
+                  horizontalInterval: interval,
                 ),
-              ),
-              bottomTitles: AxisTitles(
-                sideTitles: SideTitles(
-                  showTitles: true,
-                  reservedSize: 36, // space for 2 lines
-                  getTitlesWidget: (v, m) => SizedBox(
-                    height: 32,
-                    child: Text(
-                      title,
-                      maxLines: 2,
-                      textAlign: TextAlign.center,
-                      overflow: TextOverflow.visible,
-                      style: TextStyle(
-                        color: color,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
+                titlesData: FlTitlesData(
+                  topTitles: AxisTitles(
+                    sideTitles: SideTitles(showTitles: false),
+                  ),
+                  rightTitles: AxisTitles(
+                    sideTitles: SideTitles(showTitles: false),
+                  ),
+                  leftTitles: AxisTitles(
+                    sideTitles: SideTitles(
+                      showTitles: true,
+                      interval: interval,
+                      reservedSize: 44,
+                      getTitlesWidget: (v, m) => Text(
+                        v.toInt().toString(),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                  ),
+                  bottomTitles: AxisTitles(
+                    sideTitles: SideTitles(
+                      showTitles: true,
+                      reservedSize: 38,
+                      getTitlesWidget: (v, m) => SizedBox(
+                        height: 34,
+                        child: Text(
+                          title,
+                          maxLines: 2,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: color,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-            ),
-            barTouchData: BarTouchData(enabled: false),
-            barGroups: [
-              BarChartGroupData(
-                x: 0,
-                barRods: [
-                  BarChartRodData(
-                    toY: displayValue,
-                    color: color,
-                    width: 16,
-                    borderRadius: BorderRadius.circular(6),
+                barTouchData: BarTouchData(enabled: false),
+                barGroups: [
+                  BarChartGroupData(
+                    x: 0,
+                    barRods: [
+                      BarChartRodData(
+                        toY: displayValue,
+                        color: color,
+                        width: 16,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
+              swapAnimationDuration: Duration.zero,
+              swapAnimationCurve: Curves.linear,
+            ),
           ),
-          swapAnimationDuration: Duration.zero,
-          swapAnimationCurve: Curves.linear,
         ),
       ),
-    ),
+      const SizedBox(height: 4),
+      Text(
+        '${displayValue.toStringAsFixed(0)} $unit',
+        style: const TextStyle(color: Colors.white70, fontSize: 12),
+      ),
+    ],
   );
 }
 
@@ -162,9 +188,102 @@ double _tailwindKts(
   final diff = ((windTo - trackDeg + 540.0) % 360.0) - 180.0; // [-180,180]
   return wsKts * math.cos(_degToRad(diff));
 }
-// ...existing code...
-// ...inside class _CruiseInputScreenState, right after } // closes calculateCruise()
 
+// Parse latitude/longitude in decimal or DMS with hemisphere (N/S/E/W).
+// Examples accepted:
+//   "37.7749N", "122.4194W", "-33.86", "151.21", "37 46 30 N", "122°25'10\" W"
+double _parseCoord(String raw, {required bool isLat}) {
+  var s = raw.trim().toUpperCase().replaceAll(',', '.');
+
+  // Detect hemisphere (N/S/E/W)
+  int sign = 1;
+  if (s.contains('S')) sign = -1;
+  if (s.contains('W')) sign = -1;
+
+  // Remove hemisphere letters and symbols
+  s = s.replaceAll(RegExp('[NSEW°′’\'″"]'), ' ').trim();
+
+  // Extract numeric parts (deg, min, sec)
+  final parts = RegExp(
+    r'[-+]?\d+(\.\d+)?',
+  ).allMatches(s).map((m) => double.parse(m.group(0)!)).toList();
+
+  double value;
+  if (parts.isEmpty) return double.nan;
+  if (parts.length == 1) {
+    value = parts[0]; // decimal degrees
+  } else if (parts.length == 2) {
+    value = parts[0] + parts[1] / 60.0; // deg + min
+  } else {
+    value = parts[0] + parts[1] / 60.0 + parts[2] / 3600.0; // deg + min + sec
+  }
+
+  // If the original string had an explicit leading sign, honor it
+  if (RegExp(r'^\s*-').hasMatch(raw)) sign = -1;
+
+  value *= sign;
+
+  // Clamp to valid ranges
+  final maxAbs = isLat ? 90.0 : 180.0;
+  if (value.abs() > maxAbs) return double.nan;
+
+  return value;
+}
+
+// Optional: great-circle distance in NM (if you decide to auto-fill Mission Distance)
+double _gcDistanceNm(double lat1, double lon1, double lat2, double lon2) {
+  const rNm = 3440.065;
+  final dLat = _degToRad(lat2 - lat1);
+  final dLon = _degToRad(lon2 - lon1);
+  final a =
+      math.sin(dLat / 2) * math.sin(dLat / 2) +
+      math.cos(_degToRad(lat1)) *
+          math.cos(_degToRad(lat2)) *
+          math.sin(dLon / 2) *
+          math.sin(dLon / 2);
+  final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+  return rNm * c;
+}
+
+String _formatDms(double value, {required bool isLat}) {
+  if (!value.isFinite) return '--';
+  final hemi = isLat ? (value >= 0 ? 'N' : 'S') : (value >= 0 ? 'E' : 'W');
+  double absVal = value.abs();
+  int deg = absVal.floor();
+  double minFloat = (absVal - deg) * 60.0;
+  int min = minFloat.floor();
+  double sec = (minFloat - min) * 60.0;
+
+  if (sec >= 59.95) {
+    sec = 0;
+    min += 1;
+    if (min == 60) {
+      min = 0;
+      deg += 1;
+    }
+  }
+
+  final degStr = isLat
+      ? deg.toString().padLeft(2, '0')
+      : deg.toString().padLeft(3, '0');
+  final minStr = min.toString().padLeft(2, '0');
+  final secFixed = sec.toStringAsFixed(1);
+  final secStr = sec < 10 ? '0$secFixed' : secFixed;
+  return '$hemi $degStr° $minStr\' $secStr"';
+}
+
+// Add these in rcreenState fields (with other controllers)
+final hospitalLatController = TextEditingController();
+final hospitalLonController = TextEditingController();
+String? hospitalLatError, hospitalLonError;
+bool useHospitalWaypoint = false;
+
+final finalLatController = TextEditingController();
+final finalLonController = TextEditingController();
+String? finalLatError, finalLonError;
+bool useFinalDestination = false;
+
+// ...update the dialog signature to accept suggested IAS...
 void showCruiseResultsDialog({
   required BuildContext context,
   required double endurance,
@@ -180,8 +299,15 @@ void showCruiseResultsDialog({
   required double adjustedFuelBurn,
   required double hoistMinutesRounded,
   required double hoistFuel,
-  double? aiAltitudeFt, // NEW
-  double? aiTailwindKts, // NEW
+  double? aiAltitudeFt,
+  double? aiTailwindKts,
+  double? aiTailwindOutKts,
+  double? aiTailwindBackKts,
+  double? aiSuggestedIas,
+  double? originLat,
+  double? originLon,
+  double? destLat,
+  double? destLon,
 }) {
   final int fuelRemRounded = fuelRemaining.round();
 
@@ -203,12 +329,16 @@ void showCruiseResultsDialog({
                 ),
                 const SizedBox(height: 12),
 
+                // ...inside showCruiseResultsDialog Column children...
                 Text('Endurance: ${endurance.toStringAsFixed(2)} hrs'),
                 Text(
                   'Estimated Range: ${estimatedRange.toStringAsFixed(0)} NM',
                 ),
                 Text(
-                  'Mission Distance (RT): ${missionDistance.toStringAsFixed(0)} NM',
+                  'Mission Distance (one-way): ${missionDistance.toStringAsFixed(0)} NM',
+                ),
+                Text(
+                  'Round Trip Distance: ${(missionDistance * 2).toStringAsFixed(0)} NM',
                 ),
                 Text(
                   'Mission Duration: ${missionDuration.toStringAsFixed(2)} hrs',
@@ -236,16 +366,39 @@ void showCruiseResultsDialog({
                 Text('Cruise Speed: ${cruiseSpeed.toStringAsFixed(0)} knots'),
                 Text('Altitude: ${altitude.toStringAsFixed(0)} ft'),
                 Text('Temperature: ${temperature.toStringAsFixed(0)} °C'),
-                Text(
-                  'Fuel Burn Rate: ${adjustedFuelBurn.toStringAsFixed(1)} kg/hr',
-                ),
-                if (aiAltitudeFt != null && aiTailwindKts != null)
+
+                // Coordinates (shown if provided)
+                if (originLat != null && originLon != null)
                   Text(
-                    'AI: Suggested altitude ~${aiAltitudeFt!.toStringAsFixed(0)} ft '
-                    '(${aiTailwindKts!.toStringAsFixed(0)} kt tailwind)',
-                    style: const TextStyle(color: Colors.cyanAccent),
+                    'Origin: ${_formatDms(originLat, isLat: true)}  '
+                    '${_formatDms(originLon, isLat: false)}',
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                if (destLat != null && destLon != null)
+                  Text(
+                    'Destination: ${_formatDms(destLat, isLat: true)}  '
+                    '${_formatDms(destLon, isLat: false)}',
+                    style: const TextStyle(color: Colors.white70),
                   ),
 
+                // AI suggestions
+                if (aiAltitudeFt != null && aiTailwindKts != null)
+                  Text(
+                    'AI: Suggested altitude ~${aiAltitudeFt.toStringAsFixed(0)} ft '
+                    '(${aiTailwindKts.toStringAsFixed(0)} kt avg tailwind)',
+                    style: const TextStyle(color: Colors.cyanAccent),
+                  ),
+                if (aiTailwindOutKts != null && aiTailwindBackKts != null)
+                  Text(
+                    'AI winds: Out ${aiTailwindOutKts.toStringAsFixed(0)} kt | '
+                    'Back ${aiTailwindBackKts.toStringAsFixed(0)} kt',
+                    style: const TextStyle(color: Colors.cyanAccent),
+                  ),
+                if (aiSuggestedIas != null)
+                  Text(
+                    'AI: Suggested cruise ≈ ${aiSuggestedIas.toStringAsFixed(0)} kts',
+                    style: const TextStyle(color: Colors.cyanAccent),
+                  ),
                 if (lowFuelWarning)
                   const Padding(
                     padding: EdgeInsets.only(top: 8),
@@ -274,9 +427,9 @@ void showCruiseResultsDialog({
                           margin: const EdgeInsets.only(bottom: 12),
                           padding: const EdgeInsets.all(6),
                           decoration: BoxDecoration(
-                            color: Colors.grey[850],
+                            color: kPanelColor,
                             borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.grey[700]!),
+                            border: Border.all(color: Colors.grey.shade700),
                           ),
                           child: buildMiniBarChart(
                             title: 'Torque %',
@@ -295,9 +448,9 @@ void showCruiseResultsDialog({
                           margin: const EdgeInsets.only(bottom: 12),
                           padding: const EdgeInsets.all(6),
                           decoration: BoxDecoration(
-                            color: Colors.grey[850],
+                            color: kPanelColor,
                             borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.grey[700]!),
+                            border: Border.all(color: Colors.grey.shade700),
                           ),
                           child: buildMiniBarChart(
                             title: 'Fuel Burn\n(kg/hr)',
@@ -321,9 +474,9 @@ void showCruiseResultsDialog({
                           margin: const EdgeInsets.only(bottom: 12),
                           padding: const EdgeInsets.all(6),
                           decoration: BoxDecoration(
-                            color: Colors.grey[850],
+                            color: kPanelColor,
                             borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.grey[700]!),
+                            border: Border.all(color: Colors.grey.shade700),
                           ),
                           child: buildMiniBarChart(
                             title: 'Fuel\nRemaining (kg)',
@@ -351,10 +504,6 @@ void showCruiseResultsDialog({
   );
 }
 
-// ...existing code...
-
-// ...existing code...
-
 final Map<int, Map<int, int>> fuelBurnTable0ft = {
   0: {50: 345, 60: 392, 80: 460, 90: 493, 100: 525},
   20: {50: 365, 60: 398, 80: 465, 90: 491, 100: 535},
@@ -378,7 +527,6 @@ final Map<int, Map<int, int>> fuelBurnTable6000ft = {
   0: {50: 321, 60: 355, 80: 421, 90: 455, 100: 485},
   20: {50: 327, 60: 360, 80: 407, 90: 460, 100: 508},
   40: {50: 327, 60: 360, 80: 407, 90: 460, 100: 508},
-  // repeated row for missing value
 };
 final Map<int, Map<int, Map<int, int>>> fuelBurnTables = {
   0: fuelBurnTable0ft,
@@ -412,14 +560,13 @@ final Map<int, Map<int, Map<int, double>>> speedTables = {
     40: {50: 93, 60: 112, 70: 123}, // incomplete row
   },
 };
+
 double interpolateFuelBurn(double torque, int altitude, int oat) {
-  // Find closest altitude
   final altKeys = fuelBurnTables.keys.toList()..sort();
   int closestAlt = altKeys.reduce(
     (a, b) => (a - altitude).abs() < (b - altitude).abs() ? a : b,
   );
 
-  // Find closest temperature
   final tempTable = fuelBurnTables[closestAlt]!;
   final tempKeys = tempTable.keys.toList()..sort();
   int closestTemp = tempKeys.reduce(
@@ -441,13 +588,11 @@ double interpolateFuelBurn(double torque, int altitude, int oat) {
 }
 
 double getTorqueForIAS(int altitude, int oat, double ias) {
-  // Find closest altitude
   final altKeys = speedTables.keys.toList()..sort();
   int closestAlt = altKeys.reduce(
     (a, b) => (a - altitude).abs() < (b - altitude).abs() ? a : b,
   );
 
-  // Find closest temperature
   final tempTable = speedTables[closestAlt]!;
   final tempKeys = tempTable.keys.toList()..sort();
   int closestTemp = tempKeys.reduce(
@@ -457,11 +602,6 @@ double getTorqueForIAS(int altitude, int oat, double ias) {
   final table = tempTable[closestTemp]!;
   final tqKeys = table.keys.toList()..sort();
 
-  // Debug output
-  print('DEBUG: Altitude=$altitude, Temp=$oat, IAS=$ias');
-  print('DEBUG: Table=$table');
-
-  // Find the two torque keys whose speeds bracket the requested IAS
   for (int i = 0; i < tqKeys.length - 1; i++) {
     double lowerIAS = table[tqKeys[i]]!;
     double upperIAS = table[tqKeys[i + 1]]!;
@@ -470,17 +610,20 @@ double getTorqueForIAS(int altitude, int oat, double ias) {
       return tqKeys[i] + ratio * (tqKeys[i + 1] - tqKeys[i]);
     }
   }
-  // If IAS is below/above range, return closest torque value
-  if (ias < table[tqKeys.first]!) return tqKeys.first.toDouble();
-  if (ias > table[tqKeys.last]!) return tqKeys.last.toDouble();
-  // If not found, return closest torque
+  if (ias < table[tqKeys.first]!) {
+    return tqKeys.first.toDouble();
+  }
+
+  if (ias > table[tqKeys.last]!) {
+    return tqKeys.last.toDouble();
+  }
+
   int closestTorque = tqKeys.reduce(
     (a, b) => (table[a]! - ias).abs() < (table[b]! - ias).abs() ? a : b,
   );
   return closestTorque.toDouble();
 }
 
-// --- Correction factor logic ---
 double getCorrectionFactor({
   required bool searchlight,
   required bool radar,
@@ -495,27 +638,21 @@ double getCorrectionFactor({
   return factor;
 }
 
-// --- Main calculation logic ---
 Map<String, double> calculateCruisePerformance({
   required double distance,
   required double cruiseSpeed,
   required int altitude,
   required int temperature,
   required bool roundTrip,
-  required double cf, // equipment correction factor
+  required double cf,
 }) {
-  // Get base torque from chart for IAS, altitude, temperature
   double baseTorqueReference = getTorqueForIAS(
     altitude,
     temperature,
     cruiseSpeed,
   );
-  // Add equipment penalty as a percentage
   const double maxCf = 1.1; // sum of all equipment correction factors
   double requiredTorque = baseTorqueReference * (1 + (cf / maxCf) * 0.11);
-  print(
-    'DEBUG: baseTorqueReference=$baseTorqueReference, cf=$cf, requiredTorque=$requiredTorque',
-  );
 
   double fuelBurnPerHour = interpolateFuelBurn(
     requiredTorque,
@@ -550,7 +687,6 @@ Widget buildToggle(
   );
 }
 
-// --- Equipment toggles widget ---
 Widget buildEquipmentToggles(
   BuildContext context,
   bool searchlight,
@@ -592,83 +728,317 @@ Widget buildEquipmentToggles(
       ),
     ],
   );
-  // ...existing code...
 }
 
-// --- Replace your _CruiseInputScreenState toggles and calculation ---
+// Single, clean widget + state (remove any other duplicate class blocks above)
 class CruiseInputScreen extends StatefulWidget {
   const CruiseInputScreen({super.key});
   @override
-  _CruiseInputScreenState createState() => _CruiseInputScreenState();
+  State<CruiseInputScreen> createState() => CruiseInputScreenState();
 }
 
-class _CruiseInputScreenState extends State<CruiseInputScreen> {
+class CruiseInputScreenState extends State<CruiseInputScreen> {
+  // Core numeric state
   double cruiseSpeed = 130;
   double missionDistance = 100;
   double altitude = 2000;
   double temperature = 20;
-  double weight = 6400;
   double fuelOnboard = 1200;
   double extraHoistMinutes = 0;
-  double? _lastRequiredTorque, _lastAdjustedFuelBurn, _lastFuelRemaining;
 
+  // Last calculation snapshot (for side charts)
+  double? _lastRequiredTorque;
+  double? _lastAdjustedFuelBurn;
+  double? _lastFuelRemaining;
+
+  // Text controllers
   final cruiseSpeedController = TextEditingController();
   final missionDistanceController = TextEditingController();
   final altitudeController = TextEditingController();
   final temperatureController = TextEditingController();
-  final weightController = TextEditingController();
   final fuelController = TextEditingController();
   final hoistTimeController = TextEditingController();
-
-  bool selectAllOptional = false;
-  bool searchlight = false;
-  bool radar = false;
-  bool flir = false;
-  bool hoist = false;
-  // Winds Aloft toggles and inputs
-  bool useWindsAloft = false; // master on/off
-  bool standardWinds = true; // if true, assume 0 kt winds
-  bool useDeviceLocation = true; // origin from GPS; else manual
   final originLatController = TextEditingController();
   final originLonController = TextEditingController();
   final destLatController = TextEditingController();
   final destLonController = TextEditingController();
 
-  // AI suggestion outputs
-  double? _aiSuggestedAltitudeFt; // among 2000/4000/6000
-  double? _aiTailwindKts; // tailwind at suggested altitude
+  // Equipment toggles
+  bool selectAllOptional = false;
+  bool searchlight = false;
+  bool radar = false;
+  bool flir = false;
+  bool hoist = false;
+
+  // Wind / coordinate logic
+  bool useWindsAloft = false;
+  bool standardWinds = true;
+  bool useDeviceLocation = true;
+  bool autoDistanceFromLatLon = true;
+  bool showMap = false;
+
+  // Async calc guard
+  bool _calculating = false;
+  bool autoApplyAi = true;
+  bool keepDmsFormat = true;
+
+  // Coordinate validation errors
+  String? originLatError, originLonError, destLatError, destLonError;
+  CruiseReportData? _lastReport;
+
+  // AI suggestions
+  double? _aiSuggestedAltitudeFt;
+  double? _aiTailwindKts;
+  double? _aiTailwindOutKts;
+  double? _aiTailwindBackKts;
+  double? _aiSuggestedIas;
+
+  Map<int, Map<String, double>>? _aiWindsAloft;
+  Map<int, Map<String, double>>? _departureWindsAloft;
+  Map<int, Map<String, double>>? _destinationWindsAloft;
+
+  Map<String, double> _tailOutBack(
+    double altFt,
+    double trackDeg,
+    List<Map<String, double>> baseLevels,
+  ) {
+    final wind = _interpolateWind(altFt, baseLevels);
+    final outTail = _tailwindKts(wind['speed']!, wind['dirFrom']!, trackDeg);
+    final backTail = _tailwindKts(
+      wind['speed']!,
+      wind['dirFrom']!,
+      (trackDeg + 180) % 360,
+    );
+    return {'out': outTail, 'back': backTail};
+  }
+
+  bool _mapEquals(
+    Map<int, Map<String, double>> a,
+    Map<int, Map<String, double>> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (final key in a.keys) {
+      if (!b.containsKey(key)) return false;
+      // Compare tailwind and direction for each altitude
+      if (a[key]?['tailwind'] != b[key]?['tailwind'] ||
+          a[key]?['dir'] != b[key]?['dir']) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Future<bool> _ensureLocationPermission() async {
+    final enabled = await Geolocator.isLocationServiceEnabled();
+    if (!enabled) return false;
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    return perm == LocationPermission.always ||
+        perm == LocationPermission.whileInUse;
+  }
+
+  double getOrInterpolateWind(int targetAlt, Map<int, double> windData) {
+    if (windData.containsKey(targetAlt)) return windData[targetAlt]!;
+    final keys = windData.keys.toList()..sort();
+    for (int i = 0; i < keys.length - 1; i++) {
+      if (keys[i] < targetAlt && keys[i + 1] > targetAlt) {
+        final alt1 = keys[i], alt2 = keys[i + 1];
+        final wind1 = windData[alt1]!, wind2 = windData[alt2]!;
+        final ratio = (targetAlt - alt1) / (alt2 - alt1);
+        return wind1 + (wind2 - wind1) * ratio;
+      }
+    }
+    // If out of range, return closest
+    return windData[keys.reduce(
+      (a, b) => (a - targetAlt).abs() < (b - targetAlt).abs() ? a : b,
+    )]!;
+  }
 
   @override
   void initState() {
     super.initState();
-    // Existing initializations
-    cruiseSpeedController.text = cruiseSpeed.toString();
-    missionDistanceController.text = missionDistance.toString();
-    altitudeController.text = altitude.toString();
-    temperatureController.text = temperature.toString();
-    weightController.text = weight.toString();
-    fuelController.text = fuelOnboard.toString();
-    hoistTimeController.text = extraHoistMinutes.toString();
+    cruiseSpeedController.text = cruiseSpeed.toStringAsFixed(0);
+    missionDistanceController.text = missionDistance.toStringAsFixed(0);
+    altitudeController.text = altitude.toStringAsFixed(0);
+    temperatureController.text = temperature.toStringAsFixed(0);
+    fuelController.text = fuelOnboard.toStringAsFixed(0);
+    hoistTimeController.text = extraHoistMinutes.toStringAsFixed(0);
+  }
 
-    // Winds aloft controllers
-    originLatController.text = '';
-    originLonController.text = '';
-    destLatController.text = '';
-    destLonController.text = '';
+  @override
+  void dispose() {
+    cruiseSpeedController.dispose();
+    missionDistanceController.dispose();
+    altitudeController.dispose();
+    temperatureController.dispose();
+    fuelController.dispose();
+    hoistTimeController.dispose();
+    originLatController.dispose();
+    originLonController.dispose();
+    destLatController.dispose();
+    destLonController.dispose();
+    super.dispose();
+  }
+
+  // ---------- Coordinate Handling ----------
+
+  void _formatControllerToDms(TextEditingController c, {required bool isLat}) {
+    if (!keepDmsFormat) return;
+    final v = _parseCoord(c.text, isLat: isLat);
+    if (!v.isFinite) return;
+    final dms = _formatDms(v, isLat: isLat);
+    if (c.text != dms) {
+      setState(() {
+        c.text = dms;
+        c.selection = TextSelection.fromPosition(
+          TextPosition(offset: c.text.length),
+        );
+      });
+    }
+  }
+
+  void _validateAndDistance() {
+    String? valErr(double v, bool isLat, String raw) {
+      if (raw.trim().isEmpty) return null;
+      if (!v.isFinite) return 'Invalid';
+      final lim = isLat ? 90.0 : 180.0;
+      if (v.abs() > lim) return 'Out of range';
+      return null;
+    }
+
+    final rawOLat = originLatController.text;
+    final rawOLon = originLonController.text;
+    final rawDLat = destLatController.text;
+    final rawDLon = destLonController.text;
+
+    final oLat = _parseCoord(rawOLat, isLat: true);
+    final oLon = _parseCoord(rawOLon, isLat: false);
+    final dLat = _parseCoord(rawDLat, isLat: true);
+    final dLon = _parseCoord(rawDLon, isLat: false);
+
+    final newOriginLatError = valErr(oLat, true, rawOLat);
+    final newOriginLonError = valErr(oLon, false, rawOLon);
+    final newDestLatError = valErr(dLat, true, rawDLat);
+    final newDestLonError = valErr(dLon, false, rawDLon);
+
+    final rawHLat = hospitalLatController.text;
+    final rawHLon = hospitalLonController.text;
+    final hLat = _parseCoord(rawHLat, isLat: true);
+    final hLon = _parseCoord(rawHLon, isLat: false);
+    final newHospitalLatError = useHospitalWaypoint
+        ? valErr(hLat, true, rawHLat)
+        : null;
+    final newHospitalLonError = useHospitalWaypoint
+        ? valErr(hLon, false, rawHLon)
+        : null;
+
+    final rawFLat = finalLatController.text;
+    final rawFLon = finalLonController.text;
+    final fLat = _parseCoord(rawFLat, isLat: true);
+    final fLon = _parseCoord(rawFLon, isLat: false);
+    final newFinalLatError = useFinalDestination
+        ? valErr(fLat, true, rawFLat)
+        : null;
+    final newFinalLonError = useFinalDestination
+        ? valErr(fLon, false, rawFLon)
+        : null;
+
+    bool changed =
+        newOriginLatError != originLatError ||
+        newOriginLonError != originLonError ||
+        newDestLatError != destLatError ||
+        newDestLonError != destLonError ||
+        newHospitalLatError != hospitalLatError ||
+        newHospitalLonError != hospitalLonError ||
+        newFinalLatError != finalLatError ||
+        newFinalLonError != finalLonError;
+
+    // ...rest of your validation logic...}
+
+    if (changed) {
+      setState(() {
+        originLatError = newOriginLatError;
+        originLonError = newOriginLonError;
+        destLatError = newDestLatError;
+        destLonError = newDestLonError;
+        hospitalLatError = newHospitalLatError;
+        hospitalLonError = newHospitalLonError;
+        finalLatError = newFinalLatError;
+        finalLonError = newFinalLonError;
+      });
+    }
+  }
+
+  Widget _coordField(
+    String label,
+    TextEditingController controller, {
+    required bool isLat,
+    required String? errorText,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: TextField(
+        controller: controller,
+        onChanged: (_) => _validateAndDistance(), // no timer
+        onEditingComplete: () {
+          _formatControllerToDms(controller, isLat: isLat);
+          _validateAndDistance();
+          FocusScope.of(context).nextFocus();
+        },
+        decoration: InputDecoration(
+          labelText: label,
+          errorText: errorText,
+          hintText: isLat ? '34 59 09.8 N' : '033 39 14.5 E',
+          border: const OutlineInputBorder(),
+          isDense: true,
+          suffixIcon: keepDmsFormat
+              ? IconButton(
+                  tooltip: 'Format DMS',
+                  icon: const Icon(
+                    Icons.my_location,
+                    size: 18,
+                    color: Colors.cyan,
+                  ),
+                  onPressed: () {
+                    _formatControllerToDms(controller, isLat: isLat);
+                    _validateAndDistance();
+                  },
+                )
+              : null,
+        ),
+        style: const TextStyle(color: Colors.white),
+        textInputAction: TextInputAction.next,
+      ),
+    );
+  }
+
+  // ---------- UI ----------
+  // NEW: helper to manually apply AI suggestions when autoApplyAi = false
+  void _applyAiSuggestions() {
+    setState(() {
+      if (_aiSuggestedIas != null && _aiSuggestedIas!.isFinite) {
+        cruiseSpeed = _aiSuggestedIas!;
+        cruiseSpeedController.text = cruiseSpeed.toStringAsFixed(0);
+      }
+      if (_aiSuggestedAltitudeFt != null && _aiSuggestedAltitudeFt!.isFinite) {
+        altitude = _aiSuggestedAltitudeFt!;
+        altitudeController.text = altitude.toStringAsFixed(0);
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    // Replace this with your actual UI layout.
     return Scaffold(
       appBar: AppBar(title: const Text('AW139 Cruise Planner v4')),
       body: LayoutBuilder(
         builder: (context, constraints) {
           final wide = constraints.maxWidth >= 900;
 
-          // Left panel: form
           final form = Padding(
-            padding: const EdgeInsets.all(16.0),
+            padding: const EdgeInsets.all(16),
             child: SingleChildScrollView(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -676,49 +1046,371 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
                   buildInputField(
                     'Cruise Speed (knots)',
                     cruiseSpeedController,
+                    readOnly: useWindsAloft && autoApplyAi,
                   ),
                   buildInputField(
                     'Mission Distance (NM)',
                     missionDistanceController,
                   ),
-                  buildInputField('Altitude (ft)', altitudeController),
+                  buildInputField(
+                    'Altitude (ft)',
+                    altitudeController,
+                    readOnly: useWindsAloft && autoApplyAi,
+                  ),
                   buildInputField('Temperature (°C)', temperatureController),
                   buildInputField('Fuel Onboard (kg)', fuelController),
                   buildInputField('Hoist Time (min)', hoistTimeController),
-                  const SizedBox(height: 16),
-                  // Winds Aloft controls
-                  SwitchListTile(
-                    title: const Text('Use Winds Aloft'),
-                    value: useWindsAloft,
-                    onChanged: (v) => setState(() => useWindsAloft = v),
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  if (useWindsAloft) ...[
+
+                  if (useWindsAloft)
+                    SwitchListTile(
+                      title: const Text('Use Winds Aloft'),
+                      value: useWindsAloft,
+                      onChanged: (v) => setState(() => useWindsAloft = v),
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                  if (useWindsAloft)
                     SwitchListTile(
                       title: const Text('Standard Winds (0 kt)'),
                       value: standardWinds,
                       onChanged: (v) => setState(() => standardWinds = v),
+                      dense: true,
                       contentPadding: EdgeInsets.zero,
                     ),
-                    SwitchListTile(
-                      title: const Text('Use device location for Origin'),
-                      value: useDeviceLocation,
-                      onChanged: (v) => setState(() => useDeviceLocation = v),
-                      contentPadding: EdgeInsets.zero,
+
+                  _coordField(
+                    'Origin Latitude',
+                    originLatController,
+                    isLat: true,
+                    errorText: originLatError,
+                  ),
+                  _coordField(
+                    'Origin Longitude',
+                    originLonController,
+                    isLat: false,
+                    errorText: originLonError,
+                  ),
+                  _coordField(
+                    'Destination Latitude',
+                    destLatController,
+                    isLat: true,
+                    errorText: destLatError,
+                  ),
+                  _coordField(
+                    'Destination Longitude',
+                    destLonController,
+                    isLat: false,
+                    errorText: destLonError,
+                  ),
+
+                  SwitchListTile(
+                    title: const Text('Add Hospital Waypoint'),
+                    value: useHospitalWaypoint,
+                    onChanged: (v) => setState(() => useHospitalWaypoint = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  if (useHospitalWaypoint) ...[
+                    _coordField(
+                      'Hospital Latitude',
+                      hospitalLatController,
+                      isLat: true,
+                      errorText: hospitalLatError,
                     ),
-                    if (!useDeviceLocation) ...[
-                      buildInputField('Origin Latitude', originLatController),
-                      buildInputField('Origin Longitude', originLonController),
-                    ],
-                    buildInputField(
-                      'Destination Latitude (optional)',
-                      destLatController,
-                    ),
-                    buildInputField(
-                      'Destination Longitude (optional)',
-                      destLonController,
+                    _coordField(
+                      'Hospital Longitude',
+                      hospitalLonController,
+                      isLat: false,
+                      errorText: hospitalLonError,
                     ),
                   ],
+
+                  SwitchListTile(
+                    title: const Text(
+                      'Set Final Destination (e.g. Refueling Base)',
+                    ),
+                    value: useFinalDestination,
+                    onChanged: (v) => setState(() => useFinalDestination = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  if (useFinalDestination) ...[
+                    _coordField(
+                      'Final Latitude',
+                      finalLatController,
+                      isLat: true,
+                      errorText: finalLatError,
+                    ),
+                    _coordField(
+                      'Final Longitude',
+                      finalLonController,
+                      isLat: false,
+                      errorText: finalLonError,
+                    ),
+                  ],
+
+                  SwitchListTile(
+                    title: const Text('Keep DMS formatting'),
+                    value: keepDmsFormat,
+                    onChanged: (v) => setState(() => keepDmsFormat = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+
+                  const SizedBox(height: 16),
+                  if (useWindsAloft &&
+                      !standardWinds &&
+                      (_aiSuggestedIas != null ||
+                          _aiSuggestedAltitudeFt != null ||
+                          _aiTailwindKts != null))
+                    Card(
+                      color: Colors.blueGrey.shade800,
+                      margin: const EdgeInsets.symmetric(vertical: 8),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'AI Flight Optimization',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.cyanAccent,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            if (_aiSuggestedIas != null)
+                              Text(
+                                'Suggested IAS: ${_aiSuggestedIas!.toStringAsFixed(0)} kt',
+                                style: const TextStyle(color: Colors.white),
+                              ),
+                            if (_aiSuggestedAltitudeFt != null)
+                              Text(
+                                'Suggested Altitude: ${_aiSuggestedAltitudeFt!.toStringAsFixed(0)} ft',
+                                style: const TextStyle(color: Colors.white),
+                              ),
+                            if (_aiTailwindOutKts != null &&
+                                _aiTailwindBackKts != null)
+                              Builder(
+                                builder: (_) {
+                                  final out = _aiTailwindOutKts!;
+                                  final back = _aiTailwindBackKts!;
+                                  final avg = (out + back) / 2.0;
+                                  return Text(
+                                    'Tailwind (Out / Back): '
+                                    '${out.toStringAsFixed(0)} / '
+                                    '${back.toStringAsFixed(0)} kt  '
+                                    '(Avg ${avg.toStringAsFixed(0)} kt)',
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                    ),
+                                  );
+                                },
+                              ),
+                            if (!autoApplyAi)
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: TextButton.icon(
+                                  onPressed:
+                                      (_aiSuggestedIas == null &&
+                                          _aiSuggestedAltitudeFt == null)
+                                      ? null
+                                      : _applyAiSuggestions,
+                                  icon: const Icon(
+                                    Icons.check_circle,
+                                    color: Colors.cyanAccent,
+                                    size: 18,
+                                  ),
+                                  label: const Text(
+                                    'Apply Suggestions',
+                                    style: TextStyle(color: Colors.cyanAccent),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  SwitchListTile(
+                    title: const Text('Use device location for Origin'),
+                    value: useDeviceLocation,
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    onChanged: (v) async {
+                      setState(() => useDeviceLocation = v);
+                      if (v) {
+                        final pos = await _getCurrentPosition();
+                        if (pos != null) {
+                          originLatController.text =
+                              '${pos.latitude.abs().toStringAsFixed(6)}${pos.latitude >= 0 ? 'N' : 'S'}';
+                          originLonController.text =
+                              '${pos.longitude.abs().toStringAsFixed(6)}${pos.longitude >= 0 ? 'E' : 'W'}';
+                          _validateAndDistance();
+                        }
+                      }
+                    },
+                  ),
+
+                  SwitchListTile(
+                    title: const Text('Auto distance from coordinates'),
+                    value: autoDistanceFromLatLon,
+                    onChanged: (v) =>
+                        setState(() => autoDistanceFromLatLon = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+
+                  SwitchListTile(
+                    title: const Text('Use Winds Aloft'),
+                    value: useWindsAloft,
+                    onChanged: (v) {
+                      setState(() {
+                        useWindsAloft = v;
+                        if (v) {
+                          standardWinds =
+                              false; // <-- Turn off zero wind by default
+                        }
+                      });
+                    },
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Show Mission Map & Weather'),
+                    value: showMap,
+                    onChanged: (v) => setState(() => showMap = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  if (showMap)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8.0),
+                      child: ElevatedButton.icon(
+                        icon: const Icon(Icons.map),
+                        label: const Text('View Map'),
+                        onPressed: () {
+                          showDialog(
+                            context: context,
+                            builder: (_) => Dialog(
+                              child: SizedBox(
+                                width: 600,
+                                height: 400,
+                                child: FlutterMap(
+                                  options: MapOptions(
+                                    initialCenter: LatLng(
+                                      _parseCoord(
+                                        originLatController.text,
+                                        isLat: true,
+                                      ),
+                                      _parseCoord(
+                                        originLonController.text,
+                                        isLat: false,
+                                      ),
+                                    ),
+                                    initialZoom: 8,
+                                  ),
+                                  children: [
+                                    TileLayer(
+                                      urlTemplate:
+                                          'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                                      subdomains: ['a', 'b', 'c'],
+                                    ),
+                                    Opacity(
+                                      opacity: 0.4,
+                                      child: TileLayer(
+                                        urlTemplate:
+                                            'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=YOUR_KEY',
+                                      ),
+                                    ),
+                                    Opacity(
+                                      opacity: 0.5,
+                                      child: TileLayer(
+                                        urlTemplate:
+                                            'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=YOUR_KEY',
+                                      ),
+                                    ),
+                                    PolylineLayer(
+                                      polylines: [
+                                        Polyline(
+                                          points: [
+                                            LatLng(
+                                              _parseCoord(
+                                                originLatController.text,
+                                                isLat: true,
+                                              ),
+                                              _parseCoord(
+                                                originLonController.text,
+                                                isLat: false,
+                                              ),
+                                            ),
+                                            LatLng(
+                                              _parseCoord(
+                                                destLatController.text,
+                                                isLat: true,
+                                              ),
+                                              _parseCoord(
+                                                destLonController.text,
+                                                isLat: false,
+                                              ),
+                                            ),
+                                            // Add hospital/final waypoints if needed
+                                          ],
+                                          color: Colors.blue,
+                                          strokeWidth: 4,
+                                        ),
+                                      ],
+                                    ),
+                                    MarkerLayer(
+                                      markers: [
+                                        Marker(
+                                          point: LatLng(
+                                            _parseCoord(
+                                              originLatController.text,
+                                              isLat: true,
+                                            ),
+                                            _parseCoord(
+                                              originLonController.text,
+                                              isLat: false,
+                                            ),
+                                          ),
+                                          width: 30,
+                                          height: 30,
+                                          child: const Icon(
+                                            Icons.location_on,
+                                            color: Colors.green,
+                                          ),
+                                        ),
+                                        Marker(
+                                          point: LatLng(
+                                            _parseCoord(
+                                              destLatController.text,
+                                              isLat: true,
+                                            ),
+                                            _parseCoord(
+                                              destLonController.text,
+                                              isLat: false,
+                                            ),
+                                          ),
+                                          width: 30,
+                                          height: 30,
+                                          child: const Icon(
+                                            Icons.flag,
+                                            color: Colors.red,
+                                          ),
+                                        ),
+                                        // Add more markers for hospital/final if needed
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+
                   buildEquipmentToggles(
                     context,
                     searchlight,
@@ -739,86 +1431,232 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
                   ),
                   const SizedBox(height: 16),
                   ElevatedButton(
+                    onPressed: _calculating
+                        ? null
+                        : () async {
+                            setState(() => _calculating = true);
+                            try {
+                              await calculateCruise();
+                            } finally {
+                              if (mounted) {
+                                setState(() => _calculating = false);
+                              }
+                            }
+                          },
+                    child: _calculating
+                        ? const SizedBox(
+                            height: 20,
+                            width: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation(Colors.white),
+                            ),
+                          )
+                        : const Text('Calculate'),
+                  ),
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.air),
+                    label: const Text('Show Winds Aloft'),
                     onPressed: () async {
-                      await calculateCruise();
+                      // Fetch wind aloft for both locations (reuse your _fetchAiAltitudeSuggestion)
+                      final originLat = _parseCoord(
+                        originLatController.text,
+                        isLat: true,
+                      );
+                      final originLon = _parseCoord(
+                        originLonController.text,
+                        isLat: false,
+                      );
+                      final destLat = _parseCoord(
+                        destLatController.text,
+                        isLat: true,
+                      );
+                      final destLon = _parseCoord(
+                        destLonController.text,
+                        isLat: false,
+                      );
+
+                      if (originLat.isFinite && originLon.isFinite) {
+                        await _fetchAiAltitudeSuggestion(
+                          lat: originLat,
+                          lon: originLon,
+                          trackDeg: 0,
+                        );
+                        _departureWindsAloft =
+                            _aiWindsAloft; // Save departure winds
+                      }
+                      if (destLat.isFinite && destLon.isFinite) {
+                        await _fetchAiAltitudeSuggestion(
+                          lat: destLat,
+                          lon: destLon,
+                          trackDeg: 0,
+                        );
+                        _destinationWindsAloft =
+                            _aiWindsAloft; // Save destination winds
+                      }
+
+                      showDialog(
+                        // ignore: use_build_context_synchronously
+                        context: context,
+                        builder: (_) => AlertDialog(
+                          title: const Text('Winds Aloft'),
+                          content: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Departure Winds Aloft:'),
+                              // Departure Winds Aloft
+                              if (_departureWindsAloft != null &&
+                                  _departureWindsAloft!.isNotEmpty)
+                                ..._departureWindsAloft!.entries.map(
+                                  (e) => Text(
+                                    'Altitude: ${e.key} ft, Tailwind: ${e.value['tailwind']?.toStringAsFixed(0) ?? '--'} kt '
+                                    ' (Dir: ${e.value['dir']?.toStringAsFixed(0) ?? '--'}°)',
+                                  ),
+                                ),
+                              if (_departureWindsAloft == null ||
+                                  _departureWindsAloft!.isEmpty)
+                                Text('No winds aloft data available'),
+                              const SizedBox(height: 12),
+                              Text('Destination Winds Aloft:'),
+                              if (_destinationWindsAloft != null &&
+                                  _destinationWindsAloft!.isNotEmpty)
+                                ..._destinationWindsAloft!.entries.map(
+                                  (e) => Text(
+                                    'Altitude: ${e.key} ft, Tailwind: ${e.value['tailwind']?.toStringAsFixed(0) ?? '--'} kt '
+                                    '(Dir: ${e.value['dir']?.toStringAsFixed(0) ?? '--'}°)',
+                                  ),
+                                ),
+                              if (_destinationWindsAloft == null ||
+                                  _destinationWindsAloft!.isEmpty)
+                                Text('No winds aloft data available'),
+                              if (_departureWindsAloft != null &&
+                                  _destinationWindsAloft != null &&
+                                  !_mapEquals(
+                                    _departureWindsAloft!,
+                                    _destinationWindsAloft!,
+                                  ))
+                                const Padding(
+                                  padding: EdgeInsets.only(top: 8),
+                                  child: Text(
+                                    '⚠️ Winds aloft differ between departure and destination!',
+                                    style: TextStyle(color: Colors.orange),
+                                  ),
+                                ),
+                            ],
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.of(context).pop(),
+                              child: const Text('Close'),
+                            ),
+                          ],
+                        ),
+                      );
                     },
-                    child: const Text('Calculate'),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _lastReport == null
+                              ? null
+                              : () =>
+                                    CruiseReportExporter.preview(_lastReport!),
+                          icon: const Icon(Icons.print),
+                          label: const Text('PDF / Print'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _lastReport == null
+                              ? null
+                              : () => CruiseReportExporter.share(_lastReport!),
+                          icon: const Icon(Icons.share),
+                          label: const Text('Share'),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
             ),
           );
-
-          // Right panel: charts (visible after Calculate)
           final chartsPanel = Padding(
             padding: const EdgeInsets.fromLTRB(8, 16, 16, 16),
             child: (_lastRequiredTorque == null)
                 ? const Text('Press Calculate to show charts')
                 : SingleChildScrollView(
                     child: Column(
-                      children: [
-                        Container(
-                          margin: const EdgeInsets.only(bottom: 12),
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: Colors.grey[850],
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.grey[700]!),
+                      children: () {
+                        final torque = _lastRequiredTorque ?? 0;
+                        final burn = _lastAdjustedFuelBurn ?? 0;
+                        final fuelRem = _lastFuelRemaining ?? 0;
+
+                        return [
+                          Container(
+                            margin: const EdgeInsets.only(bottom: 12),
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: kPanelColor,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.grey.shade700),
+                            ),
+                            child: buildMiniBarChart(
+                              title: 'Torque %',
+                              value: torque,
+                              color: Colors.orange,
+                              maxY: 120,
+                              unit: '%',
+                              height: 320,
+                            ),
                           ),
-                          child: buildMiniBarChart(
-                            title: 'Torque %',
-                            value: _lastRequiredTorque!,
-                            color: Colors.orange,
-                            maxY: 120,
-                            unit: '%',
-                            height: 320,
+                          Container(
+                            margin: const EdgeInsets.only(bottom: 12),
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: kPanelColor,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.grey.shade700),
+                            ),
+                            child: buildMiniBarChart(
+                              title: 'Fuel Burn\n(kg/hr)',
+                              value: burn,
+                              color: Colors.yellow,
+                              maxY:
+                                  ((burn <= 0
+                                          ? 100
+                                          : (burn / 100).ceil() * 100))
+                                      .toDouble(),
+                              unit: 'kg/hr',
+                              height: 320,
+                            ),
                           ),
-                        ),
-                        Container(
-                          margin: const EdgeInsets.only(bottom: 12),
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: Colors.grey[850],
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.grey[700]!),
+                          Container(
+                            margin: const EdgeInsets.only(bottom: 12),
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: kPanelColor,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.grey.shade700),
+                            ),
+                            child: buildMiniBarChart(
+                              title: 'Fuel\nRemaining (kg)',
+                              value: fuelRem,
+                              color: fuelRem <= 184
+                                  ? Colors.red
+                                  : (fuelRem <= 456
+                                        ? Colors.orange
+                                        : Colors.green),
+                              maxY: 500,
+                              unit: 'kg',
+                              height: 320,
+                            ),
                           ),
-                          child: buildMiniBarChart(
-                            title: 'Fuel Burn\n(kg/hr)',
-                            value: _lastAdjustedFuelBurn!,
-                            color: Colors.yellow,
-                            maxY:
-                                ((_lastAdjustedFuelBurn! <= 0
-                                        ? 100
-                                        : (_lastAdjustedFuelBurn! / 100)
-                                                  .ceil() *
-                                              100))
-                                    .toDouble(),
-                            unit: 'kg/hr',
-                            height: 320,
-                          ),
-                        ),
-                        Container(
-                          margin: const EdgeInsets.only(bottom: 12),
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: Colors.grey[850],
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.grey[700]!),
-                          ),
-                          child: buildMiniBarChart(
-                            title: 'Fuel\nRemaining (kg)',
-                            value: _lastFuelRemaining!,
-                            color: _lastFuelRemaining! <= 184
-                                ? Colors.red
-                                : (_lastFuelRemaining! <= 456
-                                      ? Colors.orange
-                                      : Colors.green),
-                            maxY: 500,
-                            unit: 'kg',
-                            height: 320,
-                          ),
-                        ),
-                      ],
+                        ];
+                      }(),
                     ),
                   ),
           );
@@ -834,7 +1672,6 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
             );
           }
 
-          // Narrow: stack form then charts
           return SingleChildScrollView(
             child: Column(
               children: [form, const Divider(height: 1), chartsPanel],
@@ -845,140 +1682,81 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
     );
   }
 
-  Future<void> calculateCruise() async {
-    cruiseSpeed = _parseNumber(cruiseSpeedController.text);
-    missionDistance = _parseNumber(missionDistanceController.text);
-    altitude = _parseNumber(altitudeController.text);
-    temperature = _parseNumber(temperatureController.text);
-    weight = _parseNumber(weightController.text);
-    fuelOnboard = _parseNumber(fuelController.text);
-    extraHoistMinutes = _parseNumber(hoistTimeController.text);
+  Map<String, double> _windToUV(double speedMps, double dirFromDeg) {
+    final rad = _degToRad(dirFromDeg);
+    final u = -speedMps * math.sin(rad);
+    final v = -speedMps * math.cos(rad);
+    return {'u': u, 'v': v};
+  }
 
-    if (!cruiseSpeed.isFinite || cruiseSpeed <= 0) cruiseSpeed = 1;
-    if (!missionDistance.isFinite || missionDistance < 0) missionDistance = 0;
-    if (!fuelOnboard.isFinite || fuelOnboard < 0) fuelOnboard = 0;
-    if (!extraHoistMinutes.isFinite || extraHoistMinutes < 0)
-      extraHoistMinutes = 0;
+  Map<String, double> _uvToWind(double u, double v) {
+    final speed = math.sqrt(u * u + v * v);
+    final dirFromRad = math.atan2(-u, -v);
+    final dirFromDeg = (_radToDeg(dirFromRad) + 360) % 360;
+    return {'speed': speed, 'dirFrom': dirFromDeg};
+  }
 
-    // Equipment correction
-    final cf = getCorrectionFactor(
-      searchlight: searchlight,
-      radar: radar,
-      flir: flir,
-      hoist: hoist,
-    );
-    final perf = calculateCruisePerformance(
-      distance: missionDistance,
-      cruiseSpeed: cruiseSpeed,
-      altitude: altitude.toInt(),
-      temperature: temperature.toInt(),
-      roundTrip: true,
-      cf: cf,
-    );
-    // Winds aloft (optional)
-    double tailwind = 0.0; // + tailwind, - headwind
-    _aiSuggestedAltitudeFt = null;
-    _aiTailwindKts = null;
-
-    if (useWindsAloft && !standardWinds) {
-      double? lat, lon;
-      if (useDeviceLocation) {
-        final pos = await _getCurrentPosition();
-        if (pos != null) {
-          lat = pos.latitude;
-          lon = pos.longitude;
-        }
-      }
-      lat ??= _parseNumber(originLatController.text);
-      lon ??= _parseNumber(originLonController.text);
-
-      final destLat = _parseNumber(destLatController.text);
-      final destLon = _parseNumber(destLonController.text);
-
-      if (lat.isFinite &&
-          lon.isFinite &&
-          destLat.isFinite &&
-          destLon.isFinite &&
-          (destLat != 0 || destLon != 0)) {
-        final trackDeg = _initialBearingDeg(lat, lon, destLat, destLon);
-        await _fetchAiAltitudeSuggestion(
-          lat: lat,
-          lon: lon,
-          trackDeg: trackDeg,
-        );
-        if (_aiTailwindKts != null) tailwind = _aiTailwindKts!;
+  Map<String, double> _interpolateWind(
+    double altFt,
+    List<Map<String, double>> levels,
+  ) {
+    if (levels.isEmpty) return {'speed': 0, 'dirFrom': 0};
+    levels.sort((a, b) => a['alt']!.compareTo(b['alt']!));
+    if (altFt <= levels.first['alt']!) {
+      return {
+        'speed': levels.first['speed']!,
+        'dirFrom': levels.first['dirFrom']!,
+      };
+    }
+    if (altFt >= levels.last['alt']!) {
+      return {
+        'speed': levels.last['speed']!,
+        'dirFrom': levels.last['dirFrom']!,
+      };
+    }
+    for (int i = 0; i < levels.length - 1; i++) {
+      final lo = levels[i];
+      final hi = levels[i + 1];
+      if (altFt >= lo['alt']! && altFt <= hi['alt']!) {
+        final r = (altFt - lo['alt']!) / (hi['alt']! - lo['alt']!);
+        final loUV = _windToUV(lo['speed']!, lo['dirFrom']!);
+        final hiUV = _windToUV(hi['speed']!, hi['dirFrom']!);
+        final u = loUV['u']! + r * (hiUV['u']! - loUV['u']!);
+        final v = loUV['v']! + r * (hiUV['v']! - loUV['v']!);
+        return _uvToWind(u, v);
       }
     }
-
-    // Round-trip timing (one-way d, then back)
-    final d = missionDistance;
-    final gsOut = (cruiseSpeed + tailwind).clamp(1.0, double.infinity);
-    final gsBack = (cruiseSpeed - tailwind).clamp(1.0, double.infinity);
-    final cruiseDuration = d / gsOut + d / gsBack;
-
-    final adjustedFuelBurn = perf['fuelBurnPerHour']!;
-    final endurance = fuelOnboard / adjustedFuelBurn;
-    final estimatedRange = cruiseSpeed * endurance;
-
-    // Hoist fuel (5-min blocks)
-    final hoistBlocks = (extraHoistMinutes / 5.0).ceil();
-    final hoistMinutesRounded = hoistBlocks * 5.0;
-    final hoistHours = hoistMinutesRounded / 60.0;
-    final hoistFuel = hoistHours * 450;
-
-    final fuelForMission = adjustedFuelBurn * cruiseDuration;
-    final fuelRemainingAfterMission = fuelOnboard - fuelForMission - hoistFuel;
-    final postMissionLowFuel = fuelRemainingAfterMission < 180;
-    final missionDuration = cruiseDuration + hoistHours;
-    setState(() {
-      _lastRequiredTorque = perf['recommendedTorque']!;
-      _lastAdjustedFuelBurn = adjustedFuelBurn;
-      _lastFuelRemaining = fuelRemainingAfterMission;
-    });
-    showCruiseResultsDialog(
-      context: context,
-      endurance: endurance,
-      estimatedRange: estimatedRange,
-      missionDistance: missionDistance,
-      missionDuration: missionDuration,
-      fuelRemaining: fuelRemainingAfterMission,
-      lowFuelWarning: postMissionLowFuel,
-      requiredTorque: perf['recommendedTorque']!,
-      cruiseSpeed: cruiseSpeed,
-      altitude: altitude,
-      temperature: temperature,
-      adjustedFuelBurn: adjustedFuelBurn,
-      hoistMinutesRounded: hoistMinutesRounded,
-      hoistFuel: hoistFuel,
-      aiAltitudeFt: _aiSuggestedAltitudeFt, // NEW
-      aiTailwindKts: _aiTailwindKts, // NEW
-    );
+    return {'speed': 0, 'dirFrom': 0};
   }
-  // ...inside class _CruiseInputScreenState, paste AFTER calculateCruise() and BEFORE buildMissionChart()
 
-  Future<bool> _ensureLocationPermission() async {
-    final enabled = await Geolocator.isLocationServiceEnabled();
-    if (!enabled) return false;
-    var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
+  // ---------- IAS Suggestion ----------
+  Map<String, double>? _suggestBestIas({
+    required int altFt,
+    required int oatC,
+    required double tailwindOutKts,
+    required double tailwindBackKts,
+    required double distanceNmOneWay,
+  }) {
+    const candidates = [120, 125, 130, 135, 140, 145, 150, 155, 160];
+    double? bestFuel;
+    Map<String, double>? best;
+    for (final ias in candidates) {
+      final tq = getTorqueForIAS(altFt, oatC, ias.toDouble());
+      final burnPerHr = interpolateFuelBurn(tq, altFt, oatC);
+      final gsOut = (ias + tailwindOutKts).clamp(30, 220);
+      final gsBack = (ias + tailwindBackKts).clamp(30, 220);
+      final timeOut = distanceNmOneWay / gsOut;
+      final timeBack = distanceNmOneWay / gsBack;
+      final totalHrs = (timeOut + timeBack).clamp(0.01, 24.0);
+      final fuel = burnPerHr * totalHrs;
+      if (bestFuel == null || fuel < bestFuel) {
+        bestFuel = fuel;
+        best = {'ias': ias.toDouble(), 'fuel': fuel, 'time': totalHrs};
+      }
     }
-    return perm == LocationPermission.always ||
-        perm == LocationPermission.whileInUse;
+    return best;
   }
 
-  Future<Position?> _getCurrentPosition() async {
-    try {
-      if (!await _ensureLocationPermission()) return null;
-      return await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
-    } catch (_) {
-      return null;
-    }
-  }
-
-  // Fetch winds aloft and suggest best among 2000/4000/6000 ft (nearest levels)
   Future<void> _fetchAiAltitudeSuggestion({
     required double lat,
     required double lon,
@@ -998,133 +1776,352 @@ class _CruiseInputScreenState extends State<CruiseInputScreen> {
       final data = jsonDecode(res.body) as Map<String, dynamic>;
       final h = data['hourly'] as Map<String, dynamic>;
 
-      final sp925 = (h['wind_speed_925hPa']?[0] ?? 0).toDouble(); // ~2500 ft
+      final sp925 = (h['wind_speed_925hPa']?[0] ?? 0).toDouble();
       final dr925 = (h['wind_direction_925hPa']?[0] ?? 0).toDouble();
-      final sp850 = (h['wind_speed_850hPa']?[0] ?? 0).toDouble(); // ~5000 ft
+      final sp850 = (h['wind_speed_850hPa']?[0] ?? 0).toDouble();
       final dr850 = (h['wind_direction_850hPa']?[0] ?? 0).toDouble();
-      final sp700 = (h['wind_speed_700hPa']?[0] ?? 0).toDouble(); // ~10000 ft
+      final sp700 = (h['wind_speed_700hPa']?[0] ?? 0).toDouble();
       final dr700 = (h['wind_direction_700hPa']?[0] ?? 0).toDouble();
 
-      final tail925 = _tailwindKts(sp925, dr925, trackDeg);
-      final tail850 = _tailwindKts(sp850, dr850, trackDeg);
-      final tail700 = _tailwindKts(sp700, dr700, trackDeg);
+      // Paste here (after parsing wind data)
+      final tailwind2000 = _tailwindKts(sp925, dr925, trackDeg);
+      final tailwind4000 = _tailwindKts(sp850, dr850, trackDeg);
+      final tailwind6000 = _tailwindKts(sp700, dr700, trackDeg);
 
-      // Map to 2000/4000/6000 ft by nearest pressure level
-      final candidates = <double, double>{
-        2000: tail925, // near 2500
-        4000: tail850, // near 5000
-        6000: tail850, // near 5000
+      _aiWindsAloft = {
+        2000: {'tailwind': tailwind2000, 'dir': dr925},
+        4000: {'tailwind': tailwind4000, 'dir': dr850},
+        6000: {'tailwind': tailwind6000, 'dir': dr700},
       };
 
-      final best = candidates.entries.reduce(
-        (a, b) => a.value >= b.value ? a : b,
-      );
-      setState(() {
-        _aiSuggestedAltitudeFt = best.key;
-        _aiTailwindKts = best.value;
-      });
+      // Base anchor levels (ft)
+      final baseLevels = <Map<String, double>>[
+        {'alt': 2000, 'speed': sp925, 'dirFrom': dr925},
+        {'alt': 4000, 'speed': sp850, 'dirFrom': dr850},
+        {'alt': 6000, 'speed': sp700, 'dirFrom': dr700},
+      ];
+
+      final candidateAltitudes = <double>[2000, 3000, 4000, 5000, 6000];
+
+      double? bestAlt;
+      double? bestFuel;
+      double? bestIas;
+      double? bestOut;
+      double? bestBack;
+
+      for (final alt in candidateAltitudes) {
+        final tails = _tailOutBack(alt, trackDeg, baseLevels);
+        final outTail = tails['out']!;
+        final backTail = tails['back']!;
+
+        final opt = _suggestBestIas(
+          altFt: alt.toInt(),
+          oatC: temperature.toInt(),
+          tailwindOutKts: outTail,
+          tailwindBackKts: backTail,
+          distanceNmOneWay: missionDistance,
+        );
+        if (opt == null) continue;
+        final fuel = opt['fuel']!;
+        if (bestFuel == null || fuel < bestFuel) {
+          bestFuel = fuel;
+          bestAlt = alt;
+          bestIas = opt['ias'];
+          bestOut = outTail;
+          bestBack = backTail;
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _aiSuggestedAltitudeFt = bestAlt;
+          _aiSuggestedIas = bestIas;
+          _aiTailwindOutKts = bestOut;
+          _aiTailwindBackKts = bestBack;
+          _aiTailwindKts = bestOut != null && bestBack != null
+              ? (bestOut + bestBack) / 2
+              : null;
+        });
+      }
     } catch (_) {
-      // ignore network errors
+      // ignore
     }
   }
 
-  // Keep these as methods on the State class (outside calculateCruise)
-  Widget buildMissionChart({
-    required double requiredTorque,
-    required double fuelBurn,
-    required double fuelRemaining,
-  }) {
-    double maxChartY = [
-      requiredTorque,
-      fuelBurn,
-      fuelRemaining,
-      200.0,
-    ].reduce((a, b) => a > b ? a : b);
-    maxChartY = (maxChartY / 100).ceil() * 100;
-
-    return SizedBox(
-      height: 200,
-      width: double.infinity,
-      child: LineChart(
-        LineChartData(
-          minY: 0,
-          maxY: maxChartY,
-          minX: 1,
-          maxX: 5,
-          gridData: FlGridData(
-            show: true,
-            drawVerticalLine: false,
-            horizontalInterval: 100,
-          ),
-          titlesData: FlTitlesData(
-            topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            leftTitles: AxisTitles(
-              sideTitles: SideTitles(
-                showTitles: true,
-                interval: 100,
-                getTitlesWidget: (value, meta) => Text(
-                  value.toInt().toString(),
-                  style: TextStyle(color: Colors.white, fontSize: 12),
-                ),
-              ),
-            ),
-            bottomTitles: AxisTitles(
-              sideTitles: SideTitles(
-                showTitles: true,
-                interval: 1,
-                getTitlesWidget: (value, meta) => Text(
-                  value.toInt().toString(),
-                  style: TextStyle(color: Colors.white, fontSize: 12),
-                ),
-              ),
-            ),
-          ),
-          lineBarsData: [
-            LineChartBarData(
-              spots: [FlSpot(1, requiredTorque), FlSpot(5, requiredTorque)],
-              isCurved: false,
-              color: Colors.orange,
-              barWidth: 4,
-              dotData: FlDotData(show: false),
-            ),
-            LineChartBarData(
-              spots: [
-                FlSpot(1, fuelBurn.roundToDouble()),
-                FlSpot(5, fuelBurn.roundToDouble()),
-              ],
-              isCurved: false,
-              color: Colors.yellow,
-              barWidth: 4,
-              dotData: FlDotData(show: false),
-            ),
-            LineChartBarData(
-              spots: [
-                FlSpot(1, fuelRemaining.roundToDouble()),
-                FlSpot(5, fuelRemaining.roundToDouble()),
-              ],
-              isCurved: false,
-              color: Colors.green,
-              barWidth: 4,
-              dotData: FlDotData(show: false),
-            ),
-          ],
-          lineTouchData: LineTouchData(enabled: false),
+  Future<Position?> _getCurrentPosition() async {
+    try {
+      final ok = await _ensureLocationPermission();
+      if (!ok) {
+        return null;
+      }
+      return await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
         ),
-      ),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> calculateCruise() async {
+    // Parse inputs
+    cruiseSpeed = _parseNumber(cruiseSpeedController.text);
+    altitude = _parseNumber(altitudeController.text);
+    temperature = _parseNumber(temperatureController.text);
+    fuelOnboard = _parseNumber(fuelController.text);
+    extraHoistMinutes = _parseNumber(hoistTimeController.text);
+
+    // Input validation
+    if (!cruiseSpeed.isFinite || cruiseSpeed <= 0) {
+      cruiseSpeed = 1;
+    }
+    if (!fuelOnboard.isFinite || fuelOnboard < 0) {
+      fuelOnboard = 0;
+    }
+    if (!extraHoistMinutes.isFinite || extraHoistMinutes < 0) {
+      extraHoistMinutes = 0;
+    }
+
+    // Reset AI suggestions
+    _aiSuggestedAltitudeFt = null;
+    _aiTailwindKts = null;
+    _aiTailwindOutKts = null;
+    _aiTailwindBackKts = null;
+    _aiSuggestedIas = null;
+
+    final cf = getCorrectionFactor(
+      searchlight: searchlight,
+      radar: radar,
+      flir: flir,
+      hoist: hoist,
+    );
+
+    // Parse coordinates
+    final originLat = _parseCoord(originLatController.text, isLat: true);
+    final originLon = _parseCoord(originLonController.text, isLat: false);
+    final destLat = _parseCoord(destLatController.text, isLat: true);
+    final destLon = _parseCoord(destLonController.text, isLat: false);
+    final hLat = _parseCoord(hospitalLatController.text, isLat: true);
+    final hLon = _parseCoord(hospitalLonController.text, isLat: false);
+    final fLat = _parseCoord(finalLatController.text, isLat: true);
+    final fLon = _parseCoord(finalLonController.text, isLat: false);
+
+    // Multi-leg distance calculation
+    double totalDistance = 0.0;
+    if (originLat.isFinite &&
+        originLon.isFinite &&
+        destLat.isFinite &&
+        destLon.isFinite) {
+      // Leg 1: Present → Mission
+      totalDistance += _gcDistanceNm(originLat, originLon, destLat, destLon);
+
+      // Leg 2: Mission → Hospital (if enabled)
+      if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
+        totalDistance += _gcDistanceNm(destLat, destLon, hLat, hLon);
+
+        // Leg 3: Hospital → Final or Present
+        if (useFinalDestination && fLat.isFinite && fLon.isFinite) {
+          totalDistance += _gcDistanceNm(hLat, hLon, fLat, fLon);
+        } else {
+          totalDistance += _gcDistanceNm(hLat, hLon, originLat, originLon);
+        }
+      } else {
+        // No hospital: Mission → Final or Present
+        if (useFinalDestination && fLat.isFinite && fLon.isFinite) {
+          totalDistance += _gcDistanceNm(destLat, destLon, fLat, fLon);
+        } else {
+          totalDistance += _gcDistanceNm(
+            destLat,
+            destLon,
+            originLat,
+            originLon,
+          );
+        }
+      }
+    }
+    missionDistance = totalDistance;
+    missionDistanceController.text = totalDistance.toStringAsFixed(0);
+
+    // Base performance (may change if AI auto-applies)
+    var perf = calculateCruisePerformance(
+      distance: missionDistance,
+      cruiseSpeed: cruiseSpeed,
+      altitude: altitude.toInt(),
+      temperature: temperature.toInt(),
+      roundTrip: true,
+      cf: cf,
+    );
+
+    double tailwindOut = 0.0;
+    double tailwindBack = 0.0;
+
+    // Normalize displayed coords (decimal)
+    if (originLat.isFinite) {
+      originLatController.text = originLat.toStringAsFixed(6);
+    }
+    if (originLon.isFinite) {
+      originLonController.text = originLon.toStringAsFixed(6);
+    }
+    if (destLat.isFinite) destLatController.text = destLat.toStringAsFixed(6);
+    if (destLon.isFinite) destLonController.text = destLon.toStringAsFixed(6);
+
+    // Fetch winds & AI suggestions
+    if (useWindsAloft && !standardWinds) {
+      if (originLat.isFinite &&
+          originLon.isFinite &&
+          destLat.isFinite &&
+          destLon.isFinite &&
+          (destLat != 0 || destLon != 0)) {
+        final trackDeg = _initialBearingDeg(
+          originLat,
+          originLon,
+          destLat,
+          destLon,
+        );
+        await _fetchAiAltitudeSuggestion(
+          lat: originLat,
+          lon: originLon,
+          trackDeg: trackDeg,
+        );
+
+        if (_aiTailwindOutKts != null) tailwindOut = _aiTailwindOutKts!;
+        if (_aiTailwindBackKts != null) tailwindBack = _aiTailwindBackKts!;
+
+        // Auto apply (only if data present)
+        if (autoApplyAi) {
+          bool changed = false;
+          if (_aiSuggestedIas != null && _aiSuggestedIas!.isFinite) {
+            cruiseSpeed = _aiSuggestedIas!;
+            cruiseSpeedController.text = cruiseSpeed.toStringAsFixed(0);
+            changed = true;
+          }
+          if (_aiSuggestedAltitudeFt != null &&
+              _aiSuggestedAltitudeFt!.isFinite) {
+            altitude = _aiSuggestedAltitudeFt!;
+            altitudeController.text = altitude.toStringAsFixed(0);
+            changed = true;
+          }
+          if (changed) {
+            perf = calculateCruisePerformance(
+              distance: missionDistance,
+              cruiseSpeed: cruiseSpeed,
+              altitude: altitude.toInt(),
+              temperature: temperature.toInt(),
+              roundTrip: true,
+              cf: cf,
+            );
+            setState(() {}); // reflect controller changes
+          }
+        }
+      }
+    }
+
+    // Final calculations
+    final d = missionDistance;
+    final gsOut = (cruiseSpeed + tailwindOut).clamp(1.0, double.infinity);
+    final gsBack = (cruiseSpeed + tailwindBack).clamp(1.0, double.infinity);
+    final cruiseDuration = d / gsOut + d / gsBack;
+
+    final adjustedFuelBurn = perf['fuelBurnPerHour']!;
+    final endurance = fuelOnboard / adjustedFuelBurn;
+    final estimatedRange = cruiseSpeed * endurance;
+
+    // Hoist / hover
+    final hoistBlocks = (extraHoistMinutes / 5.0).ceil();
+    final hoistMinutesRounded = hoistBlocks * 5.0;
+    final hoistHours = hoistMinutesRounded / 60.0;
+    final hoistFuel = hoistHours * 450;
+
+    final fuelForMission = adjustedFuelBurn * cruiseDuration;
+    final fuelRemainingAfterMission = fuelOnboard - fuelForMission - hoistFuel;
+    final postMissionLowFuel = fuelRemainingAfterMission < 180;
+    final missionDuration = cruiseDuration + hoistHours;
+
+    setState(() {
+      _lastRequiredTorque = perf['recommendedTorque']!;
+      _lastAdjustedFuelBurn = adjustedFuelBurn;
+      _lastFuelRemaining = fuelRemainingAfterMission;
+    });
+
+    if (!mounted) return;
+
+    showCruiseResultsDialog(
+      context: context,
+      endurance: endurance,
+      estimatedRange: estimatedRange,
+      missionDistance: missionDistance,
+      missionDuration: missionDuration,
+      fuelRemaining: fuelRemainingAfterMission,
+      lowFuelWarning: postMissionLowFuel,
+      requiredTorque: perf['recommendedTorque']!,
+      cruiseSpeed: cruiseSpeed,
+      altitude: altitude,
+      temperature: temperature,
+      adjustedFuelBurn: adjustedFuelBurn,
+      hoistMinutesRounded: hoistMinutesRounded,
+      hoistFuel: hoistFuel,
+      aiAltitudeFt: _aiSuggestedAltitudeFt,
+      aiTailwindKts: _aiTailwindKts,
+      aiTailwindOutKts: _aiTailwindOutKts,
+      aiTailwindBackKts: _aiTailwindBackKts,
+      aiSuggestedIas: _aiSuggestedIas,
+      originLat: originLat.isFinite ? originLat : null,
+      originLon: originLon.isFinite ? originLon : null,
+      destLat: destLat.isFinite ? destLat : null,
+      destLon: destLon.isFinite ? destLon : null,
+    );
+
+    // Winds Aloft for PDF/export
+    final windData =
+        _aiWindsAloft ??
+        {
+          2000: {'tailwind': _aiTailwindKts ?? 0, 'dir': 0},
+          4000: {'tailwind': 0, 'dir': 0},
+          6000: {'tailwind': 0, 'dir': 0},
+        };
+
+    // Store data for PDF export
+    _lastReport = CruiseReportData(
+      endurance: endurance,
+      estimatedRange: estimatedRange,
+      missionDistance: missionDistance,
+      missionDuration: missionDuration,
+      fuelRemaining: fuelRemainingAfterMission,
+      lowFuel: postMissionLowFuel,
+      requiredTorque: perf['recommendedTorque']!,
+      cruiseSpeed: cruiseSpeed,
+      altitude: altitude,
+      temperature: temperature,
+      fuelBurnPerHour: adjustedFuelBurn,
+      hoistMinutes: hoistMinutesRounded,
+      hoistFuel: hoistFuel,
+      originDmsLat: originLat.isFinite
+          ? _formatDms(originLat, isLat: true)
+          : null,
+      originDmsLon: originLon.isFinite
+          ? _formatDms(originLon, isLat: false)
+          : null,
+      destDmsLat: destLat.isFinite ? _formatDms(destLat, isLat: true) : null,
+      destDmsLon: destLon.isFinite ? _formatDms(destLon, isLat: false) : null,
+      aiAlt: _aiSuggestedAltitudeFt,
+      aiIas: _aiSuggestedIas,
+      aiTailOut: _aiTailwindOutKts,
+      aiTailBack: _aiTailwindBackKts,
+      windsAloft: {
+        2000: getOrInterpolateWind(
+          2000,
+          windData.map((k, v) => MapEntry(k, v['tailwind'] ?? 0)),
+        ),
+        4000: getOrInterpolateWind(
+          4000,
+          windData.map((k, v) => MapEntry(k, v['tailwind'] ?? 0)),
+        ),
+        6000: getOrInterpolateWind(
+          6000,
+          windData.map((k, v) => MapEntry(k, v['tailwind'] ?? 0)),
+        ),
+      },
     );
   }
-}
-
-// ...existing code...
-// ...existing code...
-
-void main() {
-  runApp(
-    MaterialApp(
-      home: CruiseInputScreen(),
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(),
-    ),
-  );
 }

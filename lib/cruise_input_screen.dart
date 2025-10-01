@@ -57,8 +57,8 @@ Widget buildInputField(
   );
 }
 
-// make buildMiniBarChart a TOP-LEVEL function (not inside any other function/class)
-Widget buildMiniBarChart({
+// make swapAnimationCurvebuildMiniBarChart a TOP-LEVEL function (not inside any other function/class)
+Widget swapAnimationCurvebuildMiniBarChart({
   required String title,
   required double value,
   required Color color,
@@ -146,8 +146,8 @@ Widget buildMiniBarChart({
                   ),
                 ],
               ),
-              swapAnimationDuration: Duration.zero,
-              swapAnimationCurve: Curves.linear,
+              duration: Duration.zero,
+              curve: Curves.linear,
             ),
           ),
         ),
@@ -272,18 +272,9 @@ String _formatDms(double value, {required bool isLat}) {
   return '$hemi $degStr° $minStr\' $secStr"';
 }
 
-// Add these in rcreenState fields (with other controllers)
-final hospitalLatController = TextEditingController();
-final hospitalLonController = TextEditingController();
-String? hospitalLatError, hospitalLonError;
-bool useHospitalWaypoint = false;
+// ...existing code...
 
-final finalLatController = TextEditingController();
-final finalLonController = TextEditingController();
-String? finalLatError, finalLonError;
-bool useFinalDestination = false;
-
-// ...update the dialog signature to accept suggested IAS...
+// ...existing code...
 void showCruiseResultsDialog({
   required BuildContext context,
   required double endurance,
@@ -431,7 +422,7 @@ void showCruiseResultsDialog({
                             borderRadius: BorderRadius.circular(8),
                             border: Border.all(color: Colors.grey.shade700),
                           ),
-                          child: buildMiniBarChart(
+                          child: swapAnimationCurvebuildMiniBarChart(
                             title: 'Torque %',
                             value: requiredTorque,
                             color: Colors.orange,
@@ -452,7 +443,7 @@ void showCruiseResultsDialog({
                             borderRadius: BorderRadius.circular(8),
                             border: Border.all(color: Colors.grey.shade700),
                           ),
-                          child: buildMiniBarChart(
+                          child: swapAnimationCurvebuildMiniBarChart(
                             title: 'Fuel Burn\n(kg/hr)',
                             value: adjustedFuelBurn,
                             color: Colors.yellow,
@@ -478,7 +469,7 @@ void showCruiseResultsDialog({
                             borderRadius: BorderRadius.circular(8),
                             border: Border.all(color: Colors.grey.shade700),
                           ),
-                          child: buildMiniBarChart(
+                          child: swapAnimationCurvebuildMiniBarChart(
                             title: 'Fuel\nRemaining (kg)',
                             value: fuelRemaining,
                             color: fuelRemRounded <= 184
@@ -762,6 +753,27 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   final originLonController = TextEditingController();
   final destLatController = TextEditingController();
   final destLonController = TextEditingController();
+  // Additional coordinate controllers (waypoint / hospital)
+  final waypoint1LatController = TextEditingController();
+  final waypoint1LonController = TextEditingController();
+  final hospitalLatController = TextEditingController();
+  final hospitalLonController = TextEditingController();
+  // Additional coordinate controllers (waypoint / hospital / waypoint2)
+  final waypoint2LatController = TextEditingController();
+  final waypoint2LonController = TextEditingController();
+
+  // Flags for optional waypoints
+  bool useWaypoint1 = false;
+  bool useHospitalWaypoint = false;
+  bool useWaypoint2 = false;
+  // (removed duplicate small build — full build method appears later)
+
+  // Coordinate validation errors for the extra waypoints
+  String? waypoint1LatError,
+      waypoint1LonError,
+      hospitalLatError,
+      hospitalLonError;
+  String? waypoint2LatError, waypoint2LonError;
 
   // Equipment toggles
   bool selectAllOptional = false;
@@ -792,6 +804,11 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   double? _aiTailwindOutKts;
   double? _aiTailwindBackKts;
   double? _aiSuggestedIas;
+
+  double interpolateWind(double windSpeed) {
+    // Example logic — adjust as needed
+    return windSpeed * 0.85;
+  }
 
   Map<int, Map<String, double>>? _aiWindsAloft;
   Map<int, Map<String, double>>? _departureWindsAloft;
@@ -856,6 +873,41 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     )]!;
   }
 
+  // Class-level wind interpolator used by _tailOutBack and AI helpers
+  Map<String, double> _interpolateWind(
+    double altFt,
+    List<Map<String, double>> levels,
+  ) {
+    if (levels.isEmpty) return {'speed': 0, 'dirFrom': 0};
+    levels.sort((a, b) => a['alt']!.compareTo(b['alt']!));
+    if (altFt <= levels.first['alt']!) {
+      return {
+        'speed': levels.first['speed']!,
+        'dirFrom': levels.first['dirFrom']!,
+      };
+    }
+    if (altFt >= levels.last['alt']!) {
+      return {
+        'speed': levels.last['speed']!,
+        'dirFrom': levels.last['dirFrom']!,
+      };
+    }
+    for (int i = 0; i < levels.length - 1; i++) {
+      final lo = levels[i];
+      final hi = levels[i + 1];
+      if (altFt >= lo['alt']! && altFt <= hi['alt']!) {
+        final r = (altFt - lo['alt']!) / (hi['alt']! - lo['alt']!);
+        final loUV = windToUV(lo['speed']!, lo['dirFrom']!);
+        final hiUV = windToUV(hi['speed']!, hi['dirFrom']!);
+        final u = loUV['u']! + r * (hiUV['u']! - loUV['u']!);
+        final v = loUV['v']! + r * (hiUV['v']! - loUV['v']!);
+        return uvToWind(u, v);
+      }
+    }
+    return {'speed': 0, 'dirFrom': 0};
+  }
+  // _interpolateWind implementation moved to class scope above
+
   @override
   void initState() {
     super.initState();
@@ -879,6 +931,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     originLonController.dispose();
     destLatController.dispose();
     destLonController.dispose();
+    waypoint1LatController.dispose();
+    waypoint1LonController.dispose();
+    hospitalLatController.dispose();
+    hospitalLonController.dispose();
+    waypoint2LatController.dispose();
+    waypoint2LonController.dispose();
     super.dispose();
   }
 
@@ -908,18 +966,29 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       return null;
     }
 
+    // ...existing code...
     final rawOLat = originLatController.text;
     final rawOLon = originLonController.text;
+    final rawW1Lat = waypoint1LatController.text;
+    final rawW1Lon = waypoint1LonController.text;
     final rawDLat = destLatController.text;
     final rawDLon = destLonController.text;
 
     final oLat = _parseCoord(rawOLat, isLat: true);
     final oLon = _parseCoord(rawOLon, isLat: false);
+    final w1Lat = _parseCoord(rawW1Lat, isLat: true);
+    final w1Lon = _parseCoord(rawW1Lon, isLat: false);
     final dLat = _parseCoord(rawDLat, isLat: true);
     final dLon = _parseCoord(rawDLon, isLat: false);
 
     final newOriginLatError = valErr(oLat, true, rawOLat);
     final newOriginLonError = valErr(oLon, false, rawOLon);
+    final newWaypoint1LatError = useWaypoint1
+        ? valErr(w1Lat, true, rawW1Lat)
+        : null;
+    final newWaypoint1LonError = useWaypoint1
+        ? valErr(w1Lon, false, rawW1Lon)
+        : null;
     final newDestLatError = valErr(dLat, true, rawDLat);
     final newDestLonError = valErr(dLon, false, rawDLon);
 
@@ -934,44 +1003,76 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         ? valErr(hLon, false, rawHLon)
         : null;
 
-    final rawFLat = finalLatController.text;
-    final rawFLon = finalLonController.text;
-    final fLat = _parseCoord(rawFLat, isLat: true);
-    final fLon = _parseCoord(rawFLon, isLat: false);
-    final newFinalLatError = useFinalDestination
-        ? valErr(fLat, true, rawFLat)
-        : null;
-    final newFinalLonError = useFinalDestination
-        ? valErr(fLon, false, rawFLon)
-        : null;
-
     bool changed =
         newOriginLatError != originLatError ||
         newOriginLonError != originLonError ||
+        newWaypoint1LatError != waypoint1LatError ||
+        newWaypoint1LonError != waypoint1LonError ||
         newDestLatError != destLatError ||
         newDestLonError != destLonError ||
         newHospitalLatError != hospitalLatError ||
-        newHospitalLonError != hospitalLonError ||
-        newFinalLatError != finalLatError ||
-        newFinalLonError != finalLonError;
+        newHospitalLonError != hospitalLonError;
 
-    // ...rest of your validation logic...}
+    // Auto compute missionDistance (one-way) when enabled
+    if (autoDistanceFromLatLon) {
+      final points = <LatLng>[];
+      if (oLat.isFinite && oLon.isFinite) {
+        points.add(LatLng(oLat, oLon));
+      }
+      if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
+        points.add(LatLng(hLat, hLon));
+      }
+      if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
+        points.add(LatLng(w1Lat, w1Lon));
+      }
+      if (dLat.isFinite && dLon.isFinite) {
+        points.add(LatLng(dLat, dLon));
+      }
+
+      if (points.length >= 2) {
+        double total = 0.0;
+        for (int i = 0; i < points.length - 1; i++) {
+          total += _gcDistanceNm(
+            points[i].latitude,
+            points[i].longitude,
+            points[i + 1].latitude,
+            points[i + 1].longitude,
+          );
+        }
+        missionDistanceController.text = total.toStringAsFixed(0);
+        missionDistance = total;
+      }
+    }
 
     if (changed) {
       setState(() {
         originLatError = newOriginLatError;
         originLonError = newOriginLonError;
+        waypoint1LatError = newWaypoint1LatError;
+        waypoint1LonError = newWaypoint1LonError;
         destLatError = newDestLatError;
         destLonError = newDestLonError;
         hospitalLatError = newHospitalLatError;
         hospitalLonError = newHospitalLonError;
-        finalLatError = newFinalLatError;
-        finalLonError = newFinalLonError;
       });
     }
+    // ...existing code...
+    if (changed) {
+      setState(() {
+        originLatError = newOriginLatError;
+        originLonError = newOriginLonError;
+        waypoint1LatError = newWaypoint1LatError;
+        waypoint1LonError = newWaypoint1LonError;
+        destLatError = newDestLatError;
+        destLonError = newDestLonError;
+        hospitalLatError = newHospitalLatError;
+        hospitalLonError = newHospitalLonError;
+      });
+    }
+    // end _validateAndDistance
   }
 
-  Widget _coordField(
+  Widget coordField(
     String label,
     TextEditingController controller, {
     required bool isLat,
@@ -1016,7 +1117,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
 
   // ---------- UI ----------
   // NEW: helper to manually apply AI suggestions when autoApplyAi = false
-  void _applyAiSuggestions() {
+  void applyAiSuggestions() {
     setState(() {
       if (_aiSuggestedIas != null && _aiSuggestedIas!.isFinite) {
         cruiseSpeed = _aiSuggestedIas!;
@@ -1061,63 +1162,410 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                   buildInputField('Fuel Onboard (kg)', fuelController),
                   buildInputField('Hoist Time (min)', hoistTimeController),
 
-                  if (useWindsAloft)
-                    SwitchListTile(
-                      title: const Text('Use Winds Aloft'),
-                      value: useWindsAloft,
-                      onChanged: (v) => setState(() => useWindsAloft = v),
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
+                  // --- 4 toggles placed here ---
+                  SwitchListTile(
+                    title: const Text('Use device location for Origin'),
+                    value: useDeviceLocation,
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    onChanged: (v) async {
+                      setState(() => useDeviceLocation = v);
+                      if (v) {
+                        final pos = await getCurrentPosition();
+                        if (pos != null) {
+                          originLatController.text =
+                              '${pos.latitude.abs().toStringAsFixed(6)}${pos.latitude >= 0 ? 'N' : 'S'}';
+                          originLonController.text =
+                              '${pos.longitude.abs().toStringAsFixed(6)}${pos.longitude >= 0 ? 'E' : 'W'}';
+                          _validateAndDistance();
+                        }
+                      }
+                    },
+                  ),
+                  SwitchListTile(
+                    title: const Text('Auto distance from coordinates'),
+                    value: autoDistanceFromLatLon,
+                    onChanged: (v) =>
+                        setState(() => autoDistanceFromLatLon = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Use Winds Aloft'),
+                    value: useWindsAloft,
+                    onChanged: (v) {
+                      setState(() {
+                        useWindsAloft = v;
+                        if (v) {
+                          standardWinds = false;
+                        }
+                      });
+                    },
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Show Mission Map & Weather'),
+                    value: showMap,
+                    onChanged: (v) => setState(() => showMap = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  // ...existing code...
+                  if (showMap)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8.0),
+                      child: ElevatedButton.icon(
+                        icon: const Icon(Icons.map),
+                        label: const Text('View Map'),
+                        onPressed: () {
+                          showDialog(
+                            context: context,
+                            builder: (_) => Dialog(
+                              child: SizedBox(
+                                width: 600,
+                                height: 400,
+                                child: FlutterMap(
+                                  options: MapOptions(
+                                    initialCenter: LatLng(
+                                      _parseCoord(
+                                        originLatController.text,
+                                        isLat: true,
+                                      ),
+                                      _parseCoord(
+                                        originLonController.text,
+                                        isLat: false,
+                                      ),
+                                    ),
+                                    initialZoom: 8,
+                                  ),
+                                  children: <Widget>[
+                                    TileLayer(
+                                      urlTemplate:
+                                          'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                                      subdomains: const ['a', 'b', 'c'],
+                                    ),
+                                    Opacity(
+                                      opacity: 0.4,
+                                      child: TileLayer(
+                                        urlTemplate:
+                                            'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=YOUR_API_KEY',
+                                      ),
+                                    ),
+                                    Opacity(
+                                      opacity: 0.5,
+                                      child: TileLayer(
+                                        urlTemplate:
+                                            'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=YOUR_API_KEY',
+                                      ),
+                                    ),
+                                    Opacity(
+                                      opacity: 0.7,
+                                      child: TileLayer(
+                                        urlTemplate:
+                                            'https://tile.openweathermap.org/map/wind_new/{z}/{x}/{y}.png?appid=YOUR_API_KEY',
+                                      ),
+                                    ),
+                                    PolylineLayer(
+                                      polylines: [
+                                        Polyline(
+                                          points: [
+                                            if (_parseCoord(
+                                                  originLatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  originLonController.text,
+                                                  isLat: false,
+                                                ).isFinite)
+                                              LatLng(
+                                                _parseCoord(
+                                                  originLatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  originLonController.text,
+                                                  isLat: false,
+                                                ),
+                                              ),
+                                            if (useHospitalWaypoint &&
+                                                hospitalLatController
+                                                    .text
+                                                    .isNotEmpty &&
+                                                hospitalLonController
+                                                    .text
+                                                    .isNotEmpty &&
+                                                _parseCoord(
+                                                  hospitalLatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  hospitalLonController.text,
+                                                  isLat: false,
+                                                ).isFinite)
+                                              LatLng(
+                                                _parseCoord(
+                                                  hospitalLatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  hospitalLonController.text,
+                                                  isLat: false,
+                                                ),
+                                              ),
+                                            if (useWaypoint1 &&
+                                                waypoint1LatController
+                                                    .text
+                                                    .isNotEmpty &&
+                                                waypoint1LonController
+                                                    .text
+                                                    .isNotEmpty &&
+                                                _parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ).isFinite)
+                                              LatLng(
+                                                _parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ),
+                                              ),
+                                            if (useWaypoint1 &&
+                                                waypoint1LatController
+                                                    .text
+                                                    .isNotEmpty &&
+                                                waypoint1LonController
+                                                    .text
+                                                    .isNotEmpty &&
+                                                _parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ).isFinite)
+                                              LatLng(
+                                                _parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ),
+                                              ),
+                                            if (_parseCoord(
+                                                  destLatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  destLonController.text,
+                                                  isLat: false,
+                                                ).isFinite)
+                                              LatLng(
+                                                _parseCoord(
+                                                  destLatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  destLonController.text,
+                                                  isLat: false,
+                                                ),
+                                              ),
+                                          ],
+                                          color: Colors.blue,
+                                          strokeWidth: 4,
+                                        ),
+                                      ],
+                                    ),
+                                    MarkerLayer(
+                                      markers: [
+                                        if (_parseCoord(
+                                              originLatController.text,
+                                              isLat: true,
+                                            ).isFinite &&
+                                            _parseCoord(
+                                              originLonController.text,
+                                              isLat: false,
+                                            ).isFinite)
+                                          Marker(
+                                            point: LatLng(
+                                              _parseCoord(
+                                                originLatController.text,
+                                                isLat: true,
+                                              ),
+                                              _parseCoord(
+                                                originLonController.text,
+                                                isLat: false,
+                                              ),
+                                            ),
+                                            width: 30,
+                                            height: 30,
+                                            child: const Icon(
+                                              Icons.location_on,
+                                              color: Colors.green,
+                                            ),
+                                          ),
+                                        if (useHospitalWaypoint &&
+                                            hospitalLatController
+                                                .text
+                                                .isNotEmpty &&
+                                            hospitalLonController
+                                                .text
+                                                .isNotEmpty &&
+                                            _parseCoord(
+                                              hospitalLatController.text,
+                                              isLat: true,
+                                            ).isFinite &&
+                                            _parseCoord(
+                                              hospitalLonController.text,
+                                              isLat: false,
+                                            ).isFinite)
+                                          Marker(
+                                            point: LatLng(
+                                              _parseCoord(
+                                                hospitalLatController.text,
+                                                isLat: true,
+                                              ),
+                                              _parseCoord(
+                                                hospitalLonController.text,
+                                                isLat: false,
+                                              ),
+                                            ),
+                                            width: 30,
+                                            height: 30,
+                                            child: const Icon(
+                                              Icons.local_hospital,
+                                              color: Colors.pink,
+                                            ),
+                                          ),
+                                        if (useWaypoint1 &&
+                                            waypoint1LatController
+                                                .text
+                                                .isNotEmpty &&
+                                            waypoint1LonController
+                                                .text
+                                                .isNotEmpty &&
+                                            _parseCoord(
+                                              waypoint1LatController.text,
+                                              isLat: true,
+                                            ).isFinite &&
+                                            _parseCoord(
+                                              waypoint1LonController.text,
+                                              isLat: false,
+                                            ).isFinite)
+                                          Marker(
+                                            point: LatLng(
+                                              _parseCoord(
+                                                waypoint1LatController.text,
+                                                isLat: true,
+                                              ),
+                                              _parseCoord(
+                                                waypoint1LonController.text,
+                                                isLat: false,
+                                              ),
+                                            ),
+                                            width: 28,
+                                            height: 28,
+                                            child: const Icon(
+                                              Icons.location_searching,
+                                              color: Colors.cyan,
+                                            ),
+                                          ),
+                                        if (_parseCoord(
+                                              destLatController.text,
+                                              isLat: true,
+                                            ).isFinite &&
+                                            _parseCoord(
+                                              destLonController.text,
+                                              isLat: false,
+                                            ).isFinite)
+                                          Marker(
+                                            point: LatLng(
+                                              _parseCoord(
+                                                destLatController.text,
+                                                isLat: true,
+                                              ),
+                                              _parseCoord(
+                                                destLonController.text,
+                                                isLat: false,
+                                              ),
+                                            ),
+                                            width: 30,
+                                            height: 30,
+                                            child: const Icon(
+                                              Icons.flag,
+                                              color: Colors.red,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
                     ),
-                  if (useWindsAloft)
-                    SwitchListTile(
-                      title: const Text('Standard Winds (0 kt)'),
-                      value: standardWinds,
-                      onChanged: (v) => setState(() => standardWinds = v),
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                    ),
+                  // ...existing code...
+                  // ...continue with your form...
+                  // ...continue with your form...
 
-                  _coordField(
+                  // --- End toggles ---
+                  coordField(
                     'Origin Latitude',
                     originLatController,
                     isLat: true,
                     errorText: originLatError,
                   ),
-                  _coordField(
+                  coordField(
                     'Origin Longitude',
                     originLonController,
                     isLat: false,
                     errorText: originLonError,
                   ),
-                  _coordField(
+                  coordField(
                     'Destination Latitude',
                     destLatController,
                     isLat: true,
                     errorText: destLatError,
                   ),
-                  _coordField(
+                  coordField(
                     'Destination Longitude',
                     destLonController,
                     isLat: false,
                     errorText: destLonError,
                   ),
 
+                  // Hospital waypoint toggle + its fields
                   SwitchListTile(
                     title: const Text('Add Hospital Waypoint'),
                     value: useHospitalWaypoint,
-                    onChanged: (v) => setState(() => useHospitalWaypoint = v),
+                    onChanged: (v) => setState(() {
+                      useHospitalWaypoint = v;
+                      _validateAndDistance();
+                    }),
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
                   if (useHospitalWaypoint) ...[
-                    _coordField(
+                    coordField(
                       'Hospital Latitude',
                       hospitalLatController,
                       isLat: true,
                       errorText: hospitalLatError,
                     ),
-                    _coordField(
+                    coordField(
                       'Hospital Longitude',
                       hospitalLonController,
                       isLat: false,
@@ -1125,37 +1573,58 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     ),
                   ],
 
+                  // Waypoint 1 toggle + its fields
                   SwitchListTile(
-                    title: const Text(
-                      'Set Final Destination (e.g. Refueling Base)',
-                    ),
-                    value: useFinalDestination,
-                    onChanged: (v) => setState(() => useFinalDestination = v),
+                    title: const Text('Waypoint 1'),
+                    value: useWaypoint1,
+                    onChanged: (v) => setState(() {
+                      useWaypoint1 = v;
+                      _validateAndDistance();
+                    }),
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
-                  if (useFinalDestination) ...[
-                    _coordField(
-                      'Final Latitude',
-                      finalLatController,
+                  if (useWaypoint1) ...[
+                    coordField(
+                      'Waypoint 1 Latitude',
+                      waypoint1LatController,
                       isLat: true,
-                      errorText: finalLatError,
+                      errorText: waypoint1LatError,
                     ),
-                    _coordField(
-                      'Final Longitude',
-                      finalLonController,
+                    coordField(
+                      'Waypoint 1 Longitude',
+                      waypoint1LonController,
                       isLat: false,
-                      errorText: finalLonError,
+                      errorText: waypoint1LonError,
                     ),
                   ],
 
+                  // Waypoint 2 toggle + its fields
                   SwitchListTile(
-                    title: const Text('Keep DMS formatting'),
-                    value: keepDmsFormat,
-                    onChanged: (v) => setState(() => keepDmsFormat = v),
+                    title: const Text('Waypoint 2'),
+                    value: useWaypoint2,
+                    onChanged: (v) => setState(() {
+                      useWaypoint2 = v;
+                      _validateAndDistance();
+                    }),
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
+                  if (useWaypoint2) ...[
+                    coordField(
+                      'Waypoint 2 Latitude',
+                      waypoint2LatController,
+                      isLat: true,
+                      errorText: waypoint2LatError,
+                    ),
+                    coordField(
+                      'Waypoint 2 Longitude',
+                      waypoint2LonController,
+                      isLat: false,
+                      errorText: waypoint2LonError,
+                    ),
+                  ],
+                  const SizedBox(height: 16),
 
                   const SizedBox(height: 16),
                   if (useWindsAloft &&
@@ -1215,7 +1684,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                       (_aiSuggestedIas == null &&
                                           _aiSuggestedAltitudeFt == null)
                                       ? null
-                                      : _applyAiSuggestions,
+                                      : applyAiSuggestions,
                                   icon: const Icon(
                                     Icons.check_circle,
                                     color: Colors.cyanAccent,
@@ -1229,185 +1698,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                               ),
                           ],
                         ),
-                      ),
-                    ),
-
-                  SwitchListTile(
-                    title: const Text('Use device location for Origin'),
-                    value: useDeviceLocation,
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    onChanged: (v) async {
-                      setState(() => useDeviceLocation = v);
-                      if (v) {
-                        final pos = await _getCurrentPosition();
-                        if (pos != null) {
-                          originLatController.text =
-                              '${pos.latitude.abs().toStringAsFixed(6)}${pos.latitude >= 0 ? 'N' : 'S'}';
-                          originLonController.text =
-                              '${pos.longitude.abs().toStringAsFixed(6)}${pos.longitude >= 0 ? 'E' : 'W'}';
-                          _validateAndDistance();
-                        }
-                      }
-                    },
-                  ),
-
-                  SwitchListTile(
-                    title: const Text('Auto distance from coordinates'),
-                    value: autoDistanceFromLatLon,
-                    onChanged: (v) =>
-                        setState(() => autoDistanceFromLatLon = v),
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-
-                  SwitchListTile(
-                    title: const Text('Use Winds Aloft'),
-                    value: useWindsAloft,
-                    onChanged: (v) {
-                      setState(() {
-                        useWindsAloft = v;
-                        if (v) {
-                          standardWinds =
-                              false; // <-- Turn off zero wind by default
-                        }
-                      });
-                    },
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  SwitchListTile(
-                    title: const Text('Show Mission Map & Weather'),
-                    value: showMap,
-                    onChanged: (v) => setState(() => showMap = v),
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  if (showMap)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8.0),
-                      child: ElevatedButton.icon(
-                        icon: const Icon(Icons.map),
-                        label: const Text('View Map'),
-                        onPressed: () {
-                          showDialog(
-                            context: context,
-                            builder: (_) => Dialog(
-                              child: SizedBox(
-                                width: 600,
-                                height: 400,
-                                child: FlutterMap(
-                                  options: MapOptions(
-                                    initialCenter: LatLng(
-                                      _parseCoord(
-                                        originLatController.text,
-                                        isLat: true,
-                                      ),
-                                      _parseCoord(
-                                        originLonController.text,
-                                        isLat: false,
-                                      ),
-                                    ),
-                                    initialZoom: 8,
-                                  ),
-                                  children: [
-                                    TileLayer(
-                                      urlTemplate:
-                                          'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                                      subdomains: ['a', 'b', 'c'],
-                                    ),
-                                    Opacity(
-                                      opacity: 0.4,
-                                      child: TileLayer(
-                                        urlTemplate:
-                                            'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=YOUR_KEY',
-                                      ),
-                                    ),
-                                    Opacity(
-                                      opacity: 0.5,
-                                      child: TileLayer(
-                                        urlTemplate:
-                                            'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=YOUR_KEY',
-                                      ),
-                                    ),
-                                    PolylineLayer(
-                                      polylines: [
-                                        Polyline(
-                                          points: [
-                                            LatLng(
-                                              _parseCoord(
-                                                originLatController.text,
-                                                isLat: true,
-                                              ),
-                                              _parseCoord(
-                                                originLonController.text,
-                                                isLat: false,
-                                              ),
-                                            ),
-                                            LatLng(
-                                              _parseCoord(
-                                                destLatController.text,
-                                                isLat: true,
-                                              ),
-                                              _parseCoord(
-                                                destLonController.text,
-                                                isLat: false,
-                                              ),
-                                            ),
-                                            // Add hospital/final waypoints if needed
-                                          ],
-                                          color: Colors.blue,
-                                          strokeWidth: 4,
-                                        ),
-                                      ],
-                                    ),
-                                    MarkerLayer(
-                                      markers: [
-                                        Marker(
-                                          point: LatLng(
-                                            _parseCoord(
-                                              originLatController.text,
-                                              isLat: true,
-                                            ),
-                                            _parseCoord(
-                                              originLonController.text,
-                                              isLat: false,
-                                            ),
-                                          ),
-                                          width: 30,
-                                          height: 30,
-                                          child: const Icon(
-                                            Icons.location_on,
-                                            color: Colors.green,
-                                          ),
-                                        ),
-                                        Marker(
-                                          point: LatLng(
-                                            _parseCoord(
-                                              destLatController.text,
-                                              isLat: true,
-                                            ),
-                                            _parseCoord(
-                                              destLonController.text,
-                                              isLat: false,
-                                            ),
-                                          ),
-                                          width: 30,
-                                          height: 30,
-                                          child: const Icon(
-                                            Icons.flag,
-                                            color: Colors.red,
-                                          ),
-                                        ),
-                                        // Add more markers for hospital/final if needed
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          );
-                        },
                       ),
                     ),
 
@@ -1477,7 +1767,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                       );
 
                       if (originLat.isFinite && originLon.isFinite) {
-                        await _fetchAiAltitudeSuggestion(
+                        await fetchAiAltitudeSuggestion(
                           lat: originLat,
                           lon: originLon,
                           trackDeg: 0,
@@ -1486,7 +1776,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                             _aiWindsAloft; // Save departure winds
                       }
                       if (destLat.isFinite && destLon.isFinite) {
-                        await _fetchAiAltitudeSuggestion(
+                        await fetchAiAltitudeSuggestion(
                           lat: destLat,
                           lon: destLon,
                           trackDeg: 0,
@@ -1584,79 +1874,78 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               ),
             ),
           );
+          // local snapshot values for charts (avoid IIFE inside children)
+          final chartTorque = _lastRequiredTorque ?? 0;
+          final chartBurn = _lastAdjustedFuelBurn ?? 0;
+          final chartFuelRem = _lastFuelRemaining ?? 0;
+
           final chartsPanel = Padding(
             padding: const EdgeInsets.fromLTRB(8, 16, 16, 16),
             child: (_lastRequiredTorque == null)
                 ? const Text('Press Calculate to show charts')
                 : SingleChildScrollView(
                     child: Column(
-                      children: () {
-                        final torque = _lastRequiredTorque ?? 0;
-                        final burn = _lastAdjustedFuelBurn ?? 0;
-                        final fuelRem = _lastFuelRemaining ?? 0;
-
-                        return [
-                          Container(
-                            margin: const EdgeInsets.only(bottom: 12),
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: kPanelColor,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.grey.shade700),
-                            ),
-                            child: buildMiniBarChart(
-                              title: 'Torque %',
-                              value: torque,
-                              color: Colors.orange,
-                              maxY: 120,
-                              unit: '%',
-                              height: 320,
-                            ),
+                      children: [
+                        Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: kPanelColor,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.grey.shade700),
                           ),
-                          Container(
-                            margin: const EdgeInsets.only(bottom: 12),
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: kPanelColor,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.grey.shade700),
-                            ),
-                            child: buildMiniBarChart(
-                              title: 'Fuel Burn\n(kg/hr)',
-                              value: burn,
-                              color: Colors.yellow,
-                              maxY:
-                                  ((burn <= 0
-                                          ? 100
-                                          : (burn / 100).ceil() * 100))
-                                      .toDouble(),
-                              unit: 'kg/hr',
-                              height: 320,
-                            ),
+                          child: swapAnimationCurvebuildMiniBarChart(
+                            title: 'Torque %',
+                            value: chartTorque,
+                            color: Colors.orange,
+                            maxY: 120,
+                            unit: '%',
+                            height: 320,
                           ),
-                          Container(
-                            margin: const EdgeInsets.only(bottom: 12),
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: kPanelColor,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(color: Colors.grey.shade700),
-                            ),
-                            child: buildMiniBarChart(
-                              title: 'Fuel\nRemaining (kg)',
-                              value: fuelRem,
-                              color: fuelRem <= 184
-                                  ? Colors.red
-                                  : (fuelRem <= 456
-                                        ? Colors.orange
-                                        : Colors.green),
-                              maxY: 500,
-                              unit: 'kg',
-                              height: 320,
-                            ),
+                        ),
+                        Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: kPanelColor,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.grey.shade700),
                           ),
-                        ];
-                      }(),
+                          child: swapAnimationCurvebuildMiniBarChart(
+                            title: 'Fuel Burn\n(kg/hr)',
+                            value: chartBurn,
+                            color: Colors.yellow,
+                            maxY:
+                                ((chartBurn <= 0
+                                        ? 100
+                                        : (chartBurn / 100).ceil() * 100))
+                                    .toDouble(),
+                            unit: 'kg/hr',
+                            height: 320,
+                          ),
+                        ),
+                        Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: kPanelColor,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.grey.shade700),
+                          ),
+                          child: swapAnimationCurvebuildMiniBarChart(
+                            title: 'Fuel\nRemaining (kg)',
+                            value: chartFuelRem,
+                            color: chartFuelRem <= 184
+                                ? Colors.red
+                                : (chartFuelRem <= 456
+                                      ? Colors.orange
+                                      : Colors.green),
+                            maxY: 500,
+                            unit: 'kg',
+                            height: 320,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
           );
@@ -1682,55 +1971,24 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     );
   }
 
-  Map<String, double> _windToUV(double speedMps, double dirFromDeg) {
+  Map<String, double> windToUV(double speedMps, double dirFromDeg) {
     final rad = _degToRad(dirFromDeg);
     final u = -speedMps * math.sin(rad);
     final v = -speedMps * math.cos(rad);
     return {'u': u, 'v': v};
   }
 
-  Map<String, double> _uvToWind(double u, double v) {
+  Map<String, double> uvToWind(double u, double v) {
     final speed = math.sqrt(u * u + v * v);
     final dirFromRad = math.atan2(-u, -v);
     final dirFromDeg = (_radToDeg(dirFromRad) + 360) % 360;
     return {'speed': speed, 'dirFrom': dirFromDeg};
   }
 
-  Map<String, double> _interpolateWind(
-    double altFt,
-    List<Map<String, double>> levels,
-  ) {
-    if (levels.isEmpty) return {'speed': 0, 'dirFrom': 0};
-    levels.sort((a, b) => a['alt']!.compareTo(b['alt']!));
-    if (altFt <= levels.first['alt']!) {
-      return {
-        'speed': levels.first['speed']!,
-        'dirFrom': levels.first['dirFrom']!,
-      };
-    }
-    if (altFt >= levels.last['alt']!) {
-      return {
-        'speed': levels.last['speed']!,
-        'dirFrom': levels.last['dirFrom']!,
-      };
-    }
-    for (int i = 0; i < levels.length - 1; i++) {
-      final lo = levels[i];
-      final hi = levels[i + 1];
-      if (altFt >= lo['alt']! && altFt <= hi['alt']!) {
-        final r = (altFt - lo['alt']!) / (hi['alt']! - lo['alt']!);
-        final loUV = _windToUV(lo['speed']!, lo['dirFrom']!);
-        final hiUV = _windToUV(hi['speed']!, hi['dirFrom']!);
-        final u = loUV['u']! + r * (hiUV['u']! - loUV['u']!);
-        final v = loUV['v']! + r * (hiUV['v']! - loUV['v']!);
-        return _uvToWind(u, v);
-      }
-    }
-    return {'speed': 0, 'dirFrom': 0};
-  }
+  // _interpolateWind implementation moved to class scope above
 
   // ---------- IAS Suggestion ----------
-  Map<String, double>? _suggestBestIas({
+  Map<String, double>? suggestBestIas({
     required int altFt,
     required int oatC,
     required double tailwindOutKts,
@@ -1757,7 +2015,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     return best;
   }
 
-  Future<void> _fetchAiAltitudeSuggestion({
+  Future<void> fetchAiAltitudeSuggestion({
     required double lat,
     required double lon,
     required double trackDeg,
@@ -1814,7 +2072,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         final outTail = tails['out']!;
         final backTail = tails['back']!;
 
-        final opt = _suggestBestIas(
+        final opt = suggestBestIas(
           altFt: alt.toInt(),
           oatC: temperature.toInt(),
           tailwindOutKts: outTail,
@@ -1848,7 +2106,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     }
   }
 
-  Future<Position?> _getCurrentPosition() async {
+  Future<Position?> getCurrentPosition() async {
     try {
       final ok = await _ensureLocationPermission();
       if (!ok) {
@@ -1898,51 +2156,46 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     );
 
     // Parse coordinates
+    // ...existing code...
     final originLat = _parseCoord(originLatController.text, isLat: true);
     final originLon = _parseCoord(originLonController.text, isLat: false);
+    final w1Lat = _parseCoord(waypoint1LatController.text, isLat: true);
+    final w1Lon = _parseCoord(waypoint1LonController.text, isLat: false);
     final destLat = _parseCoord(destLatController.text, isLat: true);
     final destLon = _parseCoord(destLonController.text, isLat: false);
     final hLat = _parseCoord(hospitalLatController.text, isLat: true);
     final hLon = _parseCoord(hospitalLonController.text, isLat: false);
-    final fLat = _parseCoord(finalLatController.text, isLat: true);
-    final fLon = _parseCoord(finalLonController.text, isLat: false);
 
-    // Multi-leg distance calculation
+    // Build ordered sequence: Origin -> Hospital (if used) -> Waypoint1 (if used) -> Destination
     double totalDistance = 0.0;
-    if (originLat.isFinite &&
-        originLon.isFinite &&
-        destLat.isFinite &&
-        destLon.isFinite) {
-      // Leg 1: Present → Mission
-      totalDistance += _gcDistanceNm(originLat, originLon, destLat, destLon);
+    final seq = <LatLng>[];
+    if (originLat.isFinite && originLon.isFinite) {
+      seq.add(LatLng(originLat, originLon));
+    }
+    if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
+      seq.add(LatLng(hLat, hLon));
+    }
+    if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
+      seq.add(LatLng(w1Lat, w1Lon));
+    }
+    if (destLat.isFinite && destLon.isFinite) {
+      seq.add(LatLng(destLat, destLon));
+    }
 
-      // Leg 2: Mission → Hospital (if enabled)
-      if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
-        totalDistance += _gcDistanceNm(destLat, destLon, hLat, hLon);
-
-        // Leg 3: Hospital → Final or Present
-        if (useFinalDestination && fLat.isFinite && fLon.isFinite) {
-          totalDistance += _gcDistanceNm(hLat, hLon, fLat, fLon);
-        } else {
-          totalDistance += _gcDistanceNm(hLat, hLon, originLat, originLon);
-        }
-      } else {
-        // No hospital: Mission → Final or Present
-        if (useFinalDestination && fLat.isFinite && fLon.isFinite) {
-          totalDistance += _gcDistanceNm(destLat, destLon, fLat, fLon);
-        } else {
-          totalDistance += _gcDistanceNm(
-            destLat,
-            destLon,
-            originLat,
-            originLon,
-          );
-        }
+    if (seq.length >= 2) {
+      for (int i = 0; i < seq.length - 1; i++) {
+        totalDistance += _gcDistanceNm(
+          seq[i].latitude,
+          seq[i].longitude,
+          seq[i + 1].latitude,
+          seq[i + 1].longitude,
+        );
       }
     }
+
     missionDistance = totalDistance;
     missionDistanceController.text = totalDistance.toStringAsFixed(0);
-
+    // ...existing code...
     // Base performance (may change if AI auto-applies)
     var perf = calculateCruisePerformance(
       distance: missionDistance,
@@ -1979,7 +2232,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           destLat,
           destLon,
         );
-        await _fetchAiAltitudeSuggestion(
+        await fetchAiAltitudeSuggestion(
           lat: originLat,
           lon: originLon,
           trackDeg: trackDeg,
@@ -2081,6 +2334,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           6000: {'tailwind': 0, 'dir': 0},
         };
 
+    // Build a simple Map<int,double> of tailwinds to pass to getOrInterpolateWind
+    final tailwinds = <int, double>{};
+    windData.forEach((k, v) {
+      tailwinds[k] = (v['tailwind'] ?? 0).toDouble();
+    });
+
     // Store data for PDF export
     _lastReport = CruiseReportData(
       endurance: endurance,
@@ -2109,19 +2368,10 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       aiTailOut: _aiTailwindOutKts,
       aiTailBack: _aiTailwindBackKts,
       windsAloft: {
-        2000: getOrInterpolateWind(
-          2000,
-          windData.map((k, v) => MapEntry(k, v['tailwind'] ?? 0)),
-        ),
-        4000: getOrInterpolateWind(
-          4000,
-          windData.map((k, v) => MapEntry(k, v['tailwind'] ?? 0)),
-        ),
-        6000: getOrInterpolateWind(
-          6000,
-          windData.map((k, v) => MapEntry(k, v['tailwind'] ?? 0)),
-        ),
+        2000: getOrInterpolateWind(2000, tailwinds),
+        4000: getOrInterpolateWind(4000, tailwinds),
+        6000: getOrInterpolateWind(6000, tailwinds),
       },
     );
-  }
-}
+  } // end calculateCruise
+} // end CruiseInputScreenState

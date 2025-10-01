@@ -150,10 +150,11 @@ class CruiseReportExporter {
       name: 'aw139_cruise_report.pdf',
       mimeType: 'application/pdf',
     );
-    await Share.shareXFiles(
-      [file],
-      text: 'AW139 Cruise Report',
-      subject: 'AW139 Cruise Report',
+    await SharePlus.instance.share(
+      ShareParams(
+        files: [file],
+        // No text or subject here!
+      ),
     );
   }
 }

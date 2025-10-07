@@ -1,6 +1,7 @@
 // ignore_for_file: library_private_types_in_public_api
 import 'package:flutter/material.dart';
 import 'cruise_input_screen.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 void main() {
   runApp(const AW139CruiseApp());
@@ -38,10 +39,10 @@ class AW139CruiseApp extends StatelessWidget {
             borderSide: BorderSide(color: Colors.orangeAccent),
           ),
         ),
-        textTheme: baseDark.textTheme.apply(
-          bodyColor: Colors.white,
-          displayColor: Colors.white,
-        ),
+        // set app-wide font (add the font files and pubspec.yaml as well)
+        textTheme: GoogleFonts.notoSansTextTheme(
+          baseDark.textTheme,
+        ).apply(bodyColor: Colors.white, displayColor: Colors.white),
         chipTheme: baseDark.chipTheme.copyWith(
           backgroundColor: const Color(0xFF222222),
           selectedColor: Colors.orange,

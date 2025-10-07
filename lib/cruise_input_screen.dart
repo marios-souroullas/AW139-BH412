@@ -320,6 +320,8 @@ void showCruiseResultsDialog({
   double? aiTailwindOutKts,
   double? aiTailwindBackKts,
   double? aiSuggestedIas,
+  double? aiSuggestedAltitudeOutFt,
+  double? aiSuggestedAltitudeBackFt,
   double? originLat,
   double? originLon,
   double? destLat,
@@ -406,6 +408,18 @@ void showCruiseResultsDialog({
                   Text(
                     'AI: Suggested altitude ~${aiAltitudeFt.toStringAsFixed(0)} ft '
                     '(${_formatTailOrHead(aiTailwindKts)})',
+                    style: const TextStyle(color: Colors.cyanAccent),
+                  ),
+                if (aiSuggestedAltitudeOutFt != null &&
+                    aiTailwindOutKts != null)
+                  Text(
+                    'AI (Out): ~${aiSuggestedAltitudeOutFt.toStringAsFixed(0)} ft (${_formatTailOrHead(aiTailwindOutKts)})',
+                    style: const TextStyle(color: Colors.cyanAccent),
+                  ),
+                if (aiSuggestedAltitudeBackFt != null &&
+                    aiTailwindBackKts != null)
+                  Text(
+                    'AI (Back): ~${aiSuggestedAltitudeBackFt.toStringAsFixed(0)} ft (${_formatTailOrHead(aiTailwindBackKts)})',
                     style: const TextStyle(color: Colors.cyanAccent),
                   ),
                 if (aiTailwindOutKts != null && aiTailwindBackKts != null)
@@ -829,6 +843,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
 
   // AI suggestions
   double? _aiSuggestedAltitudeFt;
+  double? _aiSuggestedAltitudeOutFt;
+  double? _aiSuggestedAltitudeBackFt;
   double? _aiTailwindKts;
   double? _aiTailwindOutKts;
   double? _aiTailwindBackKts;
@@ -1894,6 +1910,17 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                 'Suggested Altitude: ${_aiSuggestedAltitudeFt!.toStringAsFixed(0)} ft',
                                 style: const TextStyle(color: Colors.white),
                               ),
+                            // show per‑leg suggested altitudes when available (prevents unused-field warnings)
+                            if (_aiSuggestedAltitudeOutFt != null)
+                              Text(
+                                'Suggested Out Altitude: ${_aiSuggestedAltitudeOutFt!.toStringAsFixed(0)} ft',
+                                style: const TextStyle(color: Colors.white70),
+                              ),
+                            if (_aiSuggestedAltitudeBackFt != null)
+                              Text(
+                                'Suggested Back Altitude: ${_aiSuggestedAltitudeBackFt!.toStringAsFixed(0)} ft',
+                                style: const TextStyle(color: Colors.white70),
+                              ),
                             if (_aiTailwindOutKts != null &&
                                 _aiTailwindBackKts != null)
                               Builder(
@@ -2509,24 +2536,73 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
 
       // Use the API-provided anchor altitudes as the candidates so AI suggests
       // one of the actual pressure-level heights instead of arbitrary fixed levels.
-      final candidateAltitudes = <double>[
-        alt925.toDouble(),
-        alt850.toDouble(),
-        alt700.toDouble(),
+      final anchors = [alt925, alt850, alt700].map((v) => v.toDouble()).toList()
+        ..sort();
+
+      // include each anchor ±1000 and ±2000 ft and also a 500ft step scan between min/max
+      final candSet = <int>{};
+      for (final a in anchors) {
+        final ai = a.toInt();
+        candSet.add(ai - 2000);
+        candSet.add(ai - 1000);
+        candSet.add(ai);
+        candSet.add(ai + 1000);
+        candSet.add(ai + 2000);
+      }
+      // also add a dense scan every 500 ft between lowest-2000 and highest+2000
+      final minA = anchors.first.toInt() - 2000;
+      final maxA = anchors.last.toInt() + 2000;
+      for (int a = (minA ~/ 500) * 500; a <= maxA; a += 500) {
+        candSet.add(a);
+      }
+      // clamp sensible bounds and remove non-positive
+      final candidateAltitudes =
+          candSet
+              .map((v) => v.clamp(500, 20000))
+              .toSet()
+              .map((v) => v.toDouble())
+              .toList()
+            ..sort();
+
+      // finer IAS candidates so we don't miss an IAS that pairs well with a particular leg wind
+      const candidateIas = [
+        110,
+        115,
+        120,
+        125,
+        130,
+        135,
+        140,
+        145,
+        150,
+        155,
+        160,
+        165,
       ];
-      candidateAltitudes.sort();
+      // ...existing code...
 
-      double? bestAlt;
-      double? bestFuel;
-      double? bestIas;
-      double? bestOut;
-      double? bestBack;
+      // best single-alt (combined outback) — original behaviour
+      double? bestSingleAlt;
+      double? bestSingleFuel;
+      double? bestSingleIas;
+      double? bestSingleOut;
+      double? bestSingleBack;
 
+      // best per-leg (out and back separately)
+      double? bestOutAlt;
+      double? bestOutFuel;
+      double? bestOutIas;
+      double? bestBackAlt;
+      double? bestBackFuel;
+      double? bestBackIas;
+
+      // ...existing code...
       for (final alt in candidateAltitudes) {
         final tails = _tailOutBack(alt, trackDeg, baseLevels);
         final outTail = tails['out']!;
         final backTail = tails['back']!;
 
+        // combined (single-alt) using existing function
         final opt = suggestBestIas(
           altFt: alt.toInt(),
           oatC: temperature.toInt(),
@@ -2534,28 +2610,129 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           tailwindBackKts: backTail,
           distanceNmOneWay: missionDistance,
         );
-        if (opt == null) continue;
-        final fuel = opt['fuel']!;
-        if (bestFuel == null || fuel < bestFuel) {
-          bestFuel = fuel;
-          bestAlt = alt;
-          bestIas = opt['ias'];
-          bestOut = outTail;
-          bestBack = backTail;
+        if (opt != null) {
+          final fuel = opt['fuel']!;
+          if (bestSingleFuel == null || fuel < bestSingleFuel) {
+            bestSingleFuel = fuel;
+            bestSingleAlt = alt;
+            bestSingleIas = opt['ias'];
+            bestSingleOut = outTail;
+            bestSingleBack = backTail;
+          }
+        }
+
+        // best IAS for this altitude for OUT leg only
+        double? bestFuelForThisOut;
+        double? bestIasForThisOut;
+        for (final ias in candidateIas) {
+          final tq = getTorqueForIAS(
+            alt.toInt(),
+            temperature.toInt(),
+            ias.toDouble(),
+          );
+          final burnPerHr = interpolateFuelBurn(
+            tq,
+            alt.toInt(),
+            temperature.toInt(),
+          );
+          final gsOut = (ias + outTail).clamp(30.0, 220.0);
+          final timeOut = missionDistance / gsOut;
+          final fuelOut = burnPerHr * timeOut;
+          if (bestFuelForThisOut == null || fuelOut < bestFuelForThisOut) {
+            bestFuelForThisOut = fuelOut;
+            bestIasForThisOut = ias.toDouble();
+          }
+        }
+        if (bestFuelForThisOut != null) {
+          if (bestOutFuel == null || bestFuelForThisOut < bestOutFuel) {
+            bestOutFuel = bestFuelForThisOut;
+            bestOutAlt = alt;
+            bestOutIas = bestIasForThisOut;
+          }
+        }
+
+        // best IAS for this altitude for BACK leg only
+        double? bestFuelForThisBack;
+        double? bestIasForThisBack;
+        for (final ias in candidateIas) {
+          final tq = getTorqueForIAS(
+            alt.toInt(),
+            temperature.toInt(),
+            ias.toDouble(),
+          );
+          final burnPerHr = interpolateFuelBurn(
+            tq,
+            alt.toInt(),
+            temperature.toInt(),
+          );
+          final gsBack = (ias + backTail).clamp(30.0, 220.0);
+          final timeBack = missionDistance / gsBack;
+          final fuelBack = burnPerHr * timeBack;
+          if (bestFuelForThisBack == null || fuelBack < bestFuelForThisBack) {
+            bestFuelForThisBack = fuelBack;
+            bestIasForThisBack = ias.toDouble();
+          }
+        }
+        if (bestFuelForThisBack != null) {
+          if (bestBackFuel == null || bestFuelForThisBack < bestBackFuel) {
+            bestBackFuel = bestFuelForThisBack;
+            bestBackAlt = alt;
+            bestBackIas = bestIasForThisBack;
+          }
         }
       }
 
+      // compare combined separate-alt fuel vs best single-alt fuel
+      double? combinedSeparateFuel;
+      if (bestOutFuel != null && bestBackFuel != null) {
+        combinedSeparateFuel = bestOutFuel + bestBackFuel;
+      }
+      // Keep both suggestions so UI can present choices
+      double? chosenOutTail;
+      double? chosenBackTail;
+      double? chosenSingleAlt = bestSingleAlt;
+      double? chosenSingleOut = bestSingleOut;
+      double? chosenSingleBack = bestSingleBack;
+
+      // choose which tailwinds to show as _aiTailwindOutKts/_aiTailwindBackKts:
+      if (combinedSeparateFuel != null &&
+          bestSingleFuel != null &&
+          combinedSeparateFuel < bestSingleFuel) {
+        // separate-alt approach is better
+        if (bestOutAlt != null) {
+          final tails = _tailOutBack(bestOutAlt, trackDeg, baseLevels);
+          chosenOutTail = tails['out']!;
+        }
+        if (bestBackAlt != null) {
+          final tails = _tailOutBack(bestBackAlt, trackDeg, baseLevels);
+          chosenBackTail = tails['back']!;
+        }
+      } else {
+        // single-alt approach or fallback
+        chosenOutTail = chosenSingleOut;
+        chosenBackTail = chosenSingleBack;
+      }
+
+      // assign to state (store both single and per-leg alt suggestions)
       if (mounted) {
         setState(() {
-          _aiSuggestedAltitudeFt = bestAlt;
-          _aiSuggestedIas = bestIas;
-          _aiTailwindOutKts = bestOut;
-          _aiTailwindBackKts = bestBack;
-          _aiTailwindKts = bestOut != null && bestBack != null
-              ? (bestOut + bestBack) / 2
+          _aiSuggestedAltitudeFt = chosenSingleAlt;
+          _aiSuggestedAltitudeOutFt = bestOutAlt;
+          _aiSuggestedAltitudeBackFt = bestBackAlt;
+          _aiSuggestedIas = bestSingleIas ?? bestOutIas ?? bestBackIas;
+          _aiTailwindOutKts = chosenOutTail;
+          _aiTailwindBackKts = chosenBackTail;
+          _aiTailwindKts = (chosenOutTail != null && chosenBackTail != null)
+              ? (chosenOutTail + chosenBackTail) / 2.0
               : null;
         });
       }
+      // DEBUG: show what the AI considered and which approach won
+      // ignore: avoid_print
+      print(
+        'AI_CHOICE: singleAlt=$chosenSingleAlt singleFuel=$bestSingleFuel outAlt=$bestOutAlt outFuel=$bestOutFuel backAlt=$bestBackAlt backFuel=$bestBackFuel combinedSeparateFuel=$combinedSeparateFuel',
+      );
+      // ...existing code...
     } catch (_) {
       // ignore network / parse errors silently
     }

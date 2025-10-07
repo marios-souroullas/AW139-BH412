@@ -10,6 +10,10 @@ import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'dart:async';
 
+// OpenWeatherMap API key (replace with your OpenWeatherMap key).
+// Do NOT commit this value to a public repo.
+const String kOpenWeatherApiKey = 'f7084ce97f81d6e4e49b7f393aa69da4';
+
 const Color kPanelColor = Color(0xFF2A2A2A);
 double _parseNumber(String s) {
   final t = s.trim().replaceAll(',', '.');
@@ -272,7 +276,28 @@ String _formatDms(double value, {required bool isLat}) {
   return '$hemi $degStr° $minStr\' $secStr"';
 }
 
+// helper: format a wind component as "Tailwind X kt" or "Headwind X kt"
+// ignore: unused_element
+String _formatTailOrHead(double w) =>
+    '${w >= 0 ? 'Tailwind' : 'Headwind'} ${w.abs().toStringAsFixed(0)} kt';
 // ...existing code...
+// convert pressure (hPa) -> approximate altitude (ft) using ISA barometric formula
+double pressureHpaToFeet(
+  double pHpa, {
+  double p0 = 1013.25,
+  double t0 = 288.15,
+}) {
+  // t0: standard sea-level temperature (K), p0: sea-level pressure (hPa)
+  const double L = 0.0065; // K/m
+  const double R = 287.05; // J/(kg·K)
+  const double g = 9.80665; // m/s^2
+  final double exponent = (R * L) / g; // ~0.190263
+  // clamp pressure to reasonable positive range
+  final p = pHpa.clamp(1.0, double.infinity);
+  final ratio = math.pow(p / p0, exponent).toDouble();
+  final meters = (t0 / L) * (1.0 - ratio);
+  return meters * 3.28084; // meters -> feet
+}
 
 // ...existing code...
 void showCruiseResultsDialog({
@@ -299,6 +324,7 @@ void showCruiseResultsDialog({
   double? originLon,
   double? destLat,
   double? destLon,
+  bool roundTrip = true,
 }) {
   final int fuelRemRounded = fuelRemaining.round();
 
@@ -328,9 +354,12 @@ void showCruiseResultsDialog({
                 Text(
                   'Mission Distance (one-way): ${missionDistance.toStringAsFixed(0)} NM',
                 ),
-                Text(
-                  'Round Trip Distance: ${(missionDistance * 2).toStringAsFixed(0)} NM',
-                ),
+                if (roundTrip)
+                  Text(
+                    'Round Trip Distance: ${(missionDistance * 2).toStringAsFixed(0)} NM',
+                  )
+                else
+                  const Text('Return leg not included (single trip)'),
                 Text(
                   'Mission Duration: ${missionDuration.toStringAsFixed(2)} hrs',
                 ),
@@ -376,13 +405,12 @@ void showCruiseResultsDialog({
                 if (aiAltitudeFt != null && aiTailwindKts != null)
                   Text(
                     'AI: Suggested altitude ~${aiAltitudeFt.toStringAsFixed(0)} ft '
-                    '(${aiTailwindKts.toStringAsFixed(0)} kt avg tailwind)',
+                    '(${_formatTailOrHead(aiTailwindKts)})',
                     style: const TextStyle(color: Colors.cyanAccent),
                   ),
                 if (aiTailwindOutKts != null && aiTailwindBackKts != null)
                   Text(
-                    'AI winds: Out ${aiTailwindOutKts.toStringAsFixed(0)} kt | '
-                    'Back ${aiTailwindBackKts.toStringAsFixed(0)} kt',
+                    'AI winds: ${_formatTailOrHead(aiTailwindOutKts)} (Out) | ${_formatTailOrHead(aiTailwindBackKts)} (Back)',
                     style: const TextStyle(color: Colors.cyanAccent),
                   ),
                 if (aiSuggestedIas != null)
@@ -796,6 +824,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
 
   // Coordinate validation errors
   String? originLatError, originLonError, destLatError, destLonError;
+  // ignore: unused_field
   CruiseReportData? _lastReport;
 
   // AI suggestions
@@ -814,6 +843,59 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   Map<int, Map<String, double>>? _departureWindsAloft;
   Map<int, Map<String, double>>? _destinationWindsAloft;
 
+  // Store wind profile arrays fetched per key (e.g. 'origin','dest')
+  final Map<String, List<Map<String, double>>> _fetchedWindLevelsByKey = {};
+
+  // Build arrow markers for a stored wind profile at a point (alt in ft)
+  List<Marker> _buildWindArrowMarkers(
+    String key,
+    double lat,
+    double lon, {
+    double alt = 2000,
+  }) {
+    final levels = _fetchedWindLevelsByKey[key];
+    if (levels == null) return [];
+    final wind = _interpolateWind(alt, levels);
+    final dirFrom = (wind['dirFrom'] ?? 0.0);
+    final speed = (wind['speed'] ?? 0.0);
+    // Wind "to" is from + 180
+    final windToDeg = (dirFrom + 180.0) % 360.0;
+    final angle = _degToRad(windToDeg);
+    // make arrows larger & high-contrast for easy visibility
+    final size = (speed * 8.0 + 32.0).clamp(20.0, 96.0);
+
+    // DEBUG: print when building arrow markers
+    // ignore: avoid_print
+    print(
+      'WIND_ARROW build key=$key lat=${lat.toStringAsFixed(6)} lon=${lon.toStringAsFixed(6)} alt=$alt speed=${speed.toStringAsFixed(2)} dirFrom=${dirFrom.toStringAsFixed(1)} windTo=$windToDeg size=$size',
+    );
+
+    return [
+      Marker(
+        point: LatLng(lat, lon),
+        width: size,
+        height: size,
+        child: Container(
+          alignment: Alignment.center,
+          // dark circular backdrop so the yellow arrow is visible on any tile
+          decoration: BoxDecoration(
+            color: Colors.black54,
+            shape: BoxShape.circle,
+            boxShadow: [BoxShadow(color: Colors.black38, blurRadius: 4)],
+          ),
+          child: Transform.rotate(
+            angle: angle,
+            child: Icon(
+              Icons.navigation,
+              color: Colors.yellowAccent,
+              size: size * 0.7,
+            ),
+          ),
+        ),
+      ),
+    ];
+  }
+
   Map<String, double> _tailOutBack(
     double altFt,
     double trackDeg,
@@ -829,6 +911,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     return {'out': outTail, 'back': backTail};
   }
 
+  // ignore: unused_element
   bool _mapEquals(
     Map<int, Map<String, double>> a,
     Map<int, Map<String, double>> b,
@@ -1223,8 +1306,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                             context: context,
                             builder: (_) => Dialog(
                               child: SizedBox(
-                                width: 600,
-                                height: 400,
+                                width: 900, // increased width
+                                height: 640, // increased height
                                 child: FlutterMap(
                                   options: MapOptions(
                                     initialCenter: LatLng(
@@ -1245,31 +1328,33 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                           'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
                                       subdomains: const ['a', 'b', 'c'],
                                     ),
+                                    // Uses kOpenWeatherApiKey constant defined at top of file
                                     Opacity(
-                                      opacity: 0.4,
+                                      opacity: 0.6,
                                       child: TileLayer(
                                         urlTemplate:
-                                            'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=YOUR_API_KEY',
+                                            'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
                                       ),
                                     ),
                                     Opacity(
-                                      opacity: 0.5,
+                                      opacity: 0.8,
                                       child: TileLayer(
                                         urlTemplate:
-                                            'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=YOUR_API_KEY',
+                                            'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
                                       ),
                                     ),
                                     Opacity(
-                                      opacity: 0.7,
+                                      opacity: 0.8,
                                       child: TileLayer(
                                         urlTemplate:
-                                            'https://tile.openweathermap.org/map/wind_new/{z}/{x}/{y}.png?appid=YOUR_API_KEY',
+                                            'https://tile.openweathermap.org/map/wind_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
                                       ),
                                     ),
                                     PolylineLayer(
                                       polylines: [
                                         Polyline(
                                           points: [
+                                            // Origin
                                             if (_parseCoord(
                                                   originLatController.text,
                                                   isLat: true,
@@ -1288,6 +1373,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                                   isLat: false,
                                                 ),
                                               ),
+                                            // Hospital (optional)
                                             if (useHospitalWaypoint &&
                                                 hospitalLatController
                                                     .text
@@ -1313,6 +1399,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                                   isLat: false,
                                                 ),
                                               ),
+                                            // Waypoint 1 (optional)
                                             if (useWaypoint1 &&
                                                 waypoint1LatController
                                                     .text
@@ -1338,31 +1425,33 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                                   isLat: false,
                                                 ),
                                               ),
-                                            if (useWaypoint1 &&
-                                                waypoint1LatController
+                                            // Waypoint 2 (optional)
+                                            if (useWaypoint2 &&
+                                                waypoint2LatController
                                                     .text
                                                     .isNotEmpty &&
-                                                waypoint1LonController
+                                                waypoint2LonController
                                                     .text
                                                     .isNotEmpty &&
                                                 _parseCoord(
-                                                  waypoint1LatController.text,
+                                                  waypoint2LatController.text,
                                                   isLat: true,
                                                 ).isFinite &&
                                                 _parseCoord(
-                                                  waypoint1LonController.text,
+                                                  waypoint2LonController.text,
                                                   isLat: false,
                                                 ).isFinite)
                                               LatLng(
                                                 _parseCoord(
-                                                  waypoint1LatController.text,
+                                                  waypoint2LatController.text,
                                                   isLat: true,
                                                 ),
                                                 _parseCoord(
-                                                  waypoint1LonController.text,
+                                                  waypoint2LonController.text,
                                                   isLat: false,
                                                 ),
                                               ),
+                                            // Destination
                                             if (_parseCoord(
                                                   destLatController.text,
                                                   isLat: true,
@@ -1387,6 +1476,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                         ),
                                       ],
                                     ),
+
+                                    // Markers for each point (same order)
                                     MarkerLayer(
                                       markers: [
                                         if (_parseCoord(
@@ -1481,6 +1572,39 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                               color: Colors.cyan,
                                             ),
                                           ),
+                                        if (useWaypoint2 &&
+                                            waypoint2LatController
+                                                .text
+                                                .isNotEmpty &&
+                                            waypoint2LonController
+                                                .text
+                                                .isNotEmpty &&
+                                            _parseCoord(
+                                              waypoint2LatController.text,
+                                              isLat: true,
+                                            ).isFinite &&
+                                            _parseCoord(
+                                              waypoint2LonController.text,
+                                              isLat: false,
+                                            ).isFinite)
+                                          Marker(
+                                            point: LatLng(
+                                              _parseCoord(
+                                                waypoint2LatController.text,
+                                                isLat: true,
+                                              ),
+                                              _parseCoord(
+                                                waypoint2LonController.text,
+                                                isLat: false,
+                                              ),
+                                            ),
+                                            width: 28,
+                                            height: 28,
+                                            child: const Icon(
+                                              Icons.location_searching,
+                                              color: Colors.cyanAccent,
+                                            ),
+                                          ),
                                         if (_parseCoord(
                                               destLatController.text,
                                               isLat: true,
@@ -1507,6 +1631,109 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                               color: Colors.red,
                                             ),
                                           ),
+                                        // Wind arrows (spread markers built from stored profiles)
+                                        ...(_parseCoord(
+                                                  hospitalLatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  hospitalLonController.text,
+                                                  isLat: false,
+                                                ).isFinite
+                                            ? _buildWindArrowMarkers(
+                                                'hospital',
+                                                _parseCoord(
+                                                  hospitalLatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  hospitalLonController.text,
+                                                  isLat: false,
+                                                ),
+                                              )
+                                            : []),
+                                        // waypoint1
+                                        ...(_parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ).isFinite
+                                            ? _buildWindArrowMarkers(
+                                                'wpt1',
+                                                _parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ),
+                                              )
+                                            : []),
+                                        // waypoint2
+                                        ...(_parseCoord(
+                                                  waypoint2LatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  waypoint2LonController.text,
+                                                  isLat: false,
+                                                ).isFinite
+                                            ? _buildWindArrowMarkers(
+                                                'wpt2',
+                                                _parseCoord(
+                                                  waypoint2LatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  waypoint2LonController.text,
+                                                  isLat: false,
+                                                ),
+                                              )
+                                            : []),
+                                        ...(_parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ).isFinite
+                                            ? _buildWindArrowMarkers(
+                                                'origin',
+                                                _parseCoord(
+                                                  waypoint1LatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  waypoint1LonController.text,
+                                                  isLat: false,
+                                                ),
+                                              )
+                                            : []),
+                                        ...(_parseCoord(
+                                                  waypoint2LatController.text,
+                                                  isLat: true,
+                                                ).isFinite &&
+                                                _parseCoord(
+                                                  waypoint2LonController.text,
+                                                  isLat: false,
+                                                ).isFinite
+                                            ? _buildWindArrowMarkers(
+                                                'origin',
+                                                _parseCoord(
+                                                  waypoint2LatController.text,
+                                                  isLat: true,
+                                                ),
+                                                _parseCoord(
+                                                  waypoint2LonController.text,
+                                                  isLat: false,
+                                                ),
+                                              )
+                                            : []),
                                       ],
                                     ),
                                   ],
@@ -1577,12 +1804,21 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                   SwitchListTile(
                     title: const Text('Waypoint 1'),
                     value: useWaypoint1,
-                    onChanged: (v) => setState(() {
-                      useWaypoint1 = v;
+                    onChanged: (v) {
+                      // update visibility first, then validate
+                      setState(() => useWaypoint1 = v);
+                      // quick console trace
+                      // ignore: avoid_print
+                      print('DEBUG: useWaypoint1 = $useWaypoint1');
                       _validateAndDistance();
-                    }),
+                    },
                     dense: true,
                     contentPadding: EdgeInsets.zero,
+                  ),
+                  // debug readout (remove after testing)
+                  Text(
+                    'DEBUG: useWaypoint1 = $useWaypoint1',
+                    style: const TextStyle(color: Colors.white70),
                   ),
                   if (useWaypoint1) ...[
                     coordField(
@@ -1666,10 +1902,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                   final back = _aiTailwindBackKts!;
                                   final avg = (out + back) / 2.0;
                                   return Text(
-                                    'Tailwind (Out / Back): '
-                                    '${out.toStringAsFixed(0)} / '
-                                    '${back.toStringAsFixed(0)} kt  '
-                                    '(Avg ${avg.toStringAsFixed(0)} kt)',
+                                    '${_formatTailOrHead(out)} (Out) / ${_formatTailOrHead(back)} (Back)  (Avg ${avg.abs().toStringAsFixed(0)} kt)',
                                     style: const TextStyle(
                                       color: Colors.white70,
                                     ),
@@ -1720,35 +1953,74 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     },
                   ),
                   const SizedBox(height: 16),
-                  ElevatedButton(
-                    onPressed: _calculating
-                        ? null
-                        : () async {
-                            setState(() => _calculating = true);
-                            try {
-                              await calculateCruise();
-                            } finally {
-                              if (mounted) {
-                                setState(() => _calculating = false);
-                              }
-                            }
-                          },
-                    child: _calculating
-                        ? const SizedBox(
-                            height: 20,
-                            width: 20,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation(Colors.white),
-                            ),
-                          )
-                        : const Text('Calculate'),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: _calculating
+                              ? null
+                              : () async {
+                                  setState(() => _calculating = true);
+                                  try {
+                                    await calculateCruise(); // default roundTrip = true
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _calculating = false);
+                                    }
+                                  }
+                                },
+                          child: _calculating
+                              ? const SizedBox(
+                                  height: 20,
+                                  width: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor: AlwaysStoppedAnimation(
+                                      Colors.white,
+                                    ),
+                                  ),
+                                )
+                              : const Text('Calculate'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: _calculating
+                              ? null
+                              : () async {
+                                  setState(() => _calculating = true);
+                                  try {
+                                    await calculateCruise(
+                                      roundTrip: false,
+                                    ); // single-trip
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _calculating = false);
+                                    }
+                                  }
+                                },
+                          child: _calculating
+                              ? const SizedBox(
+                                  height: 20,
+                                  width: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor: AlwaysStoppedAnimation(
+                                      Colors.white,
+                                    ),
+                                  ),
+                                )
+                              : const Text('Single-Trip'),
+                        ),
+                      ),
+                    ],
                   ),
+                  // ...existing code...
                   ElevatedButton.icon(
                     icon: const Icon(Icons.air),
                     label: const Text('Show Winds Aloft'),
                     onPressed: () async {
-                      // Fetch wind aloft for both locations (reuse your _fetchAiAltitudeSuggestion)
                       final originLat = _parseCoord(
                         originLatController.text,
                         isLat: true,
@@ -1765,86 +2037,204 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         destLonController.text,
                         isLat: false,
                       );
+                      final hLat = _parseCoord(
+                        hospitalLatController.text,
+                        isLat: true,
+                      );
+                      final hLon = _parseCoord(
+                        hospitalLonController.text,
+                        isLat: false,
+                      );
+                      final w1Lat = _parseCoord(
+                        waypoint1LatController.text,
+                        isLat: true,
+                      );
+                      final w1Lon = _parseCoord(
+                        waypoint1LonController.text,
+                        isLat: false,
+                      );
+                      final w2Lat = _parseCoord(
+                        waypoint2LatController.text,
+                        isLat: true,
+                      );
+                      final w2Lon = _parseCoord(
+                        waypoint2LonController.text,
+                        isLat: false,
+                      );
+
+                      final trackDeg =
+                          (originLat.isFinite &&
+                              originLon.isFinite &&
+                              destLat.isFinite &&
+                              destLon.isFinite)
+                          ? _initialBearingDeg(
+                              originLat,
+                              originLon,
+                              destLat,
+                              destLon,
+                            )
+                          : 0.0;
 
                       if (originLat.isFinite && originLon.isFinite) {
                         await fetchAiAltitudeSuggestion(
                           lat: originLat,
                           lon: originLon,
-                          trackDeg: 0,
+                          trackDeg: trackDeg,
+                          storeKey: 'origin',
                         );
-                        _departureWindsAloft =
-                            _aiWindsAloft; // Save departure winds
+                        _departureWindsAloft = _aiWindsAloft;
                       }
                       if (destLat.isFinite && destLon.isFinite) {
                         await fetchAiAltitudeSuggestion(
                           lat: destLat,
                           lon: destLon,
-                          trackDeg: 0,
+                          trackDeg: trackDeg,
+                          storeKey: 'dest',
                         );
-                        _destinationWindsAloft =
-                            _aiWindsAloft; // Save destination winds
+                        _destinationWindsAloft = _aiWindsAloft;
+                      }
+                      if (useHospitalWaypoint &&
+                          hLat.isFinite &&
+                          hLon.isFinite) {
+                        await fetchAiAltitudeSuggestion(
+                          lat: hLat,
+                          lon: hLon,
+                          trackDeg: trackDeg,
+                          storeKey: 'hospital',
+                        );
+                      }
+                      if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
+                        await fetchAiAltitudeSuggestion(
+                          lat: w1Lat,
+                          lon: w1Lon,
+                          trackDeg: trackDeg,
+                          storeKey: 'wpt1',
+                        );
+                      }
+                      if (useWaypoint2 && w2Lat.isFinite && w2Lon.isFinite) {
+                        await fetchAiAltitudeSuggestion(
+                          lat: w2Lat,
+                          lon: w2Lon,
+                          trackDeg: trackDeg,
+                          storeKey: 'wpt2',
+                        );
                       }
 
-                      showDialog(
+                      if (!mounted) return;
+                      // ignore: use_build_context_synchronously
+                      showDialog<void>(
                         // ignore: use_build_context_synchronously
                         context: context,
-                        builder: (_) => AlertDialog(
-                          title: const Text('Winds Aloft'),
-                          content: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text('Departure Winds Aloft:'),
-                              // Departure Winds Aloft
-                              if (_departureWindsAloft != null &&
-                                  _departureWindsAloft!.isNotEmpty)
-                                ..._departureWindsAloft!.entries.map(
-                                  (e) => Text(
-                                    'Altitude: ${e.key} ft, Tailwind: ${e.value['tailwind']?.toStringAsFixed(0) ?? '--'} kt '
-                                    ' (Dir: ${e.value['dir']?.toStringAsFixed(0) ?? '--'}°)',
+                        builder: (BuildContext dialogContext) {
+                          Widget buildProfileView(
+                            String title,
+                            Map<int, Map<String, dynamic>>? profile,
+                          ) {
+                            if (profile == null || profile.isEmpty) {
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    title,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  const Text('No winds aloft data available'),
+                                ],
+                              );
+                            }
+                            final entries = profile.entries.toList()
+                              ..sort((a, b) => a.key.compareTo(b.key));
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  title,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
                                   ),
                                 ),
-                              if (_departureWindsAloft == null ||
-                                  _departureWindsAloft!.isEmpty)
-                                Text('No winds aloft data available'),
-                              const SizedBox(height: 12),
-                              Text('Destination Winds Aloft:'),
-                              if (_destinationWindsAloft != null &&
-                                  _destinationWindsAloft!.isNotEmpty)
-                                ..._destinationWindsAloft!.entries.map(
-                                  (e) => Text(
-                                    'Altitude: ${e.key} ft, Tailwind: ${e.value['tailwind']?.toStringAsFixed(0) ?? '--'} kt '
-                                    '(Dir: ${e.value['dir']?.toStringAsFixed(0) ?? '--'}°)',
+                                const SizedBox(height: 6),
+                                for (final e in entries)
+                                  Text(
+                                    '${e.key} ft (${e.value['pressure'] ?? '--'} hPa): raw ${(((e.value['rawSpeedMps'] ?? 0) as num).toDouble() * 1.94384449).toStringAsFixed(1)} kt @ ${(((e.value['dir'] ?? 0) as num).toDouble()).toStringAsFixed(0)}° — ${_formatTailOrHead((((e.value['tailwind'] ?? 0) as num).toDouble()))}',
                                   ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  'Displayed altitudes: 2000 / 4000 / 6000 ft (interpolated from anchors)',
                                 ),
-                              if (_destinationWindsAloft == null ||
-                                  _destinationWindsAloft!.isEmpty)
-                                Text('No winds aloft data available'),
-                              if (_departureWindsAloft != null &&
-                                  _destinationWindsAloft != null &&
-                                  !_mapEquals(
-                                    _departureWindsAloft!,
-                                    _destinationWindsAloft!,
-                                  ))
-                                const Padding(
-                                  padding: EdgeInsets.only(top: 8),
-                                  child: Text(
-                                    '⚠️ Winds aloft differ between departure and destination!',
-                                    style: TextStyle(color: Colors.orange),
+                                const SizedBox(height: 6),
+                                for (final da in [2000, 4000, 6000])
+                                  Builder(
+                                    builder: (_) {
+                                      final value =
+                                          (_aiWindsAloft != null &&
+                                              _aiWindsAloft!.containsKey(da))
+                                          ? (((_aiWindsAloft![da]!['tailwind'] ??
+                                                        0)
+                                                    as num)
+                                                .toDouble())
+                                          : getOrInterpolateWind(da, {
+                                              for (final kv
+                                                  in (_aiWindsAloft ?? {})
+                                                      .entries)
+                                                kv.key:
+                                                    ((kv.value['tailwind'] ?? 0)
+                                                            as num)
+                                                        .toDouble(),
+                                            });
+                                      return Text(
+                                        '$da ft: ${value.toStringAsFixed(0)} kt',
+                                      );
+                                    },
                                   ),
-                                ),
-                            ],
-                          ),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.of(context).pop(),
-                              child: const Text('Close'),
+                              ],
+                            );
+                          }
+
+                          return AlertDialog(
+                            title: const Text('Winds Aloft'),
+                            content: SingleChildScrollView(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  buildProfileView(
+                                    'Departure Winds Aloft',
+                                    _departureWindsAloft
+                                        as Map<int, Map<String, dynamic>>?,
+                                  ),
+                                  const SizedBox(height: 8),
+                                  buildProfileView(
+                                    'Destination Winds Aloft',
+                                    _destinationWindsAloft
+                                        as Map<int, Map<String, dynamic>>?,
+                                  ),
+                                  const SizedBox(height: 8),
+                                  const Text(
+                                    'Note: anchors show raw API speeds (knots). Displayed altitudes are interpolated when an exact anchor is not available.',
+                                  ),
+                                ],
+                              ),
                             ),
-                          ],
-                        ),
+                            actions: [
+                              TextButton(
+                                onPressed: () =>
+                                    Navigator.of(dialogContext).pop(),
+                                child: const Text('Close'),
+                              ),
+                            ],
+                          );
+                        },
                       );
                     },
                   ),
+
+                  // ...existing code...
+                  const SizedBox(height: 12),
+
                   const SizedBox(height: 12),
                   Row(
                     children: [
@@ -2015,10 +2405,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     return best;
   }
 
+  // ...existing code...
   Future<void> fetchAiAltitudeSuggestion({
     required double lat,
     required double lon,
     required double trackDeg,
+    String? storeKey, // optional key to keep the fetched profile
   }) async {
     final uri = Uri.parse(
       'https://api.open-meteo.com/v1/forecast'
@@ -2028,6 +2420,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       'wind_speed_700hPa,wind_direction_700hPa'
       '&forecast_days=1',
     );
+
     try {
       final res = await http.get(uri);
       if (res.statusCode != 200) return;
@@ -2041,25 +2434,87 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       final sp700 = (h['wind_speed_700hPa']?[0] ?? 0).toDouble();
       final dr700 = (h['wind_direction_700hPa']?[0] ?? 0).toDouble();
 
-      // Paste here (after parsing wind data)
-      final tailwind2000 = _tailwindKts(sp925, dr925, trackDeg);
-      final tailwind4000 = _tailwindKts(sp850, dr850, trackDeg);
-      final tailwind6000 = _tailwindKts(sp700, dr700, trackDeg);
+      // compute approximate geopotential heights for the pressure levels (ft)
+      final alt925 = pressureHpaToFeet(925).round();
+      final alt850 = pressureHpaToFeet(850).round();
+      final alt700 = pressureHpaToFeet(700).round();
 
+      final tailAt925 = _tailwindKts(sp925, dr925, trackDeg);
+      final tailAt850 = _tailwindKts(sp850, dr850, trackDeg);
+      final tailAt700 = _tailwindKts(sp700, dr700, trackDeg);
+
+      // ...existing code...
       _aiWindsAloft = {
-        2000: {'tailwind': tailwind2000, 'dir': dr925},
-        4000: {'tailwind': tailwind4000, 'dir': dr850},
-        6000: {'tailwind': tailwind6000, 'dir': dr700},
+        alt925: {
+          'tailwind': tailAt925,
+          'dir': dr925,
+          'pressure': 925,
+          'rawSpeedMps': sp925,
+        },
+        alt850: {
+          'tailwind': tailAt850,
+          'dir': dr850,
+          'pressure': 850,
+          'rawSpeedMps': sp850,
+        },
+        alt700: {
+          'tailwind': tailAt700,
+          'dir': dr700,
+          'pressure': 700,
+          'rawSpeedMps': sp700,
+        },
       };
+      // ...existing code...
+      // DEBUG: show values in knots so you can compare anchors vs interpolation
+      // ignore: avoid_print
+      print(
+        'RAW_WINDS_KTS: 925=${(sp925 * 1.94384449).toStringAsFixed(1)} kt @${alt925}ft, '
+        '850=${(sp850 * 1.94384449).toStringAsFixed(1)} kt @${alt850}ft, '
+        '700=${(sp700 * 1.94384449).toStringAsFixed(1)} kt @${alt700}ft',
+      );
+      final aiWindsStr =
+          _aiWindsAloft?.entries
+              .map(
+                (e) =>
+                    '${e.key}ft:${(e.value['tailwind'])?.toStringAsFixed(1) ?? '--'}kt/${(e.value['dir'])?.toStringAsFixed(0) ?? '--'}°',
+              )
+              .join(' | ') ??
+          'none';
+      // ignore: avoid_print
+      print('AI_WINDS_ALOFT: $aiWindsStr');
+      // ...existing code...
 
-      // Base anchor levels (ft)
+      // Base anchor levels for interpolation / map markers -- use computed geopotential heights
       final baseLevels = <Map<String, double>>[
-        {'alt': 2000, 'speed': sp925, 'dirFrom': dr925},
-        {'alt': 4000, 'speed': sp850, 'dirFrom': dr850},
-        {'alt': 6000, 'speed': sp700, 'dirFrom': dr700},
+        {'alt': alt925.toDouble(), 'speed': sp925, 'dirFrom': dr925},
+        {'alt': alt850.toDouble(), 'speed': sp850, 'dirFrom': dr850},
+        {'alt': alt700.toDouble(), 'speed': sp700, 'dirFrom': dr700},
       ];
+      // ...existing code...
+      // DEBUG: raw wind speeds (m/s) from API for quick inspection
+      // ignore: avoid_print
+      print(
+        'RAW_WINDS: sp925=${sp925.toStringAsFixed(2)} m/s, sp850=${sp850.toStringAsFixed(2)} m/s, sp700=${sp700.toStringAsFixed(2)} m/s',
+      );
 
-      final candidateAltitudes = <double>[2000, 3000, 4000, 5000, 6000];
+      // optionally persist the fetched profile for later rendering on the map
+      if (storeKey != null) {
+        _fetchedWindLevelsByKey[storeKey] = baseLevels;
+        // DEBUG: confirm stored profile
+        // ignore: avoid_print
+        print(
+          'WIND_PROFILE_STORED: $storeKey -> ${baseLevels.map((m) => 'alt=${m['alt']},spd=${m['speed']},dir=${m['dirFrom']}').join('; ')}',
+        );
+      }
+
+      // Use the API-provided anchor altitudes as the candidates so AI suggests
+      // one of the actual pressure-level heights instead of arbitrary fixed levels.
+      final candidateAltitudes = <double>[
+        alt925.toDouble(),
+        alt850.toDouble(),
+        alt700.toDouble(),
+      ];
+      candidateAltitudes.sort();
 
       double? bestAlt;
       double? bestFuel;
@@ -2102,9 +2557,10 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         });
       }
     } catch (_) {
-      // ignore
+      // ignore network / parse errors silently
     }
   }
+  // ...existing code...
 
   Future<Position?> getCurrentPosition() async {
     try {
@@ -2122,7 +2578,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     }
   }
 
-  Future<void> calculateCruise() async {
+  Future<void> calculateCruise({bool roundTrip = true}) async {
     // Parse inputs
     cruiseSpeed = _parseNumber(cruiseSpeedController.text);
     altitude = _parseNumber(altitudeController.text);
@@ -2202,7 +2658,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       cruiseSpeed: cruiseSpeed,
       altitude: altitude.toInt(),
       temperature: temperature.toInt(),
-      roundTrip: true,
+      roundTrip: roundTrip,
       cf: cf,
     );
 
@@ -2261,7 +2717,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               cruiseSpeed: cruiseSpeed,
               altitude: altitude.toInt(),
               temperature: temperature.toInt(),
-              roundTrip: true,
+              roundTrip: roundTrip,
               cf: cf,
             );
             setState(() {}); // reflect controller changes
@@ -2274,7 +2730,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     final d = missionDistance;
     final gsOut = (cruiseSpeed + tailwindOut).clamp(1.0, double.infinity);
     final gsBack = (cruiseSpeed + tailwindBack).clamp(1.0, double.infinity);
-    final cruiseDuration = d / gsOut + d / gsBack;
+    final cruiseDuration = roundTrip ? (d / gsOut + d / gsBack) : (d / gsOut);
 
     final adjustedFuelBurn = perf['fuelBurnPerHour']!;
     final endurance = fuelOnboard / adjustedFuelBurn;
@@ -2298,7 +2754,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     });
 
     if (!mounted) return;
-
+    // ignore: use_build_context_synchronously
     showCruiseResultsDialog(
       context: context,
       endurance: endurance,
@@ -2323,6 +2779,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       originLon: originLon.isFinite ? originLon : null,
       destLat: destLat.isFinite ? destLat : null,
       destLon: destLon.isFinite ? destLon : null,
+      roundTrip: roundTrip,
     );
 
     // Winds Aloft for PDF/export

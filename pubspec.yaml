@@ -35,6 +35,7 @@ flutter:
 
   assets:
     - assets/fonts/
+    - assets/performance_tables/bell_412.csv
 
   fonts:
     - family: NotoSans

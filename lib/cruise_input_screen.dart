@@ -3,12 +3,18 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:aw139_cruise/export/cruise_report_export.dart'; // <-- add this line
-import 'package:flutter/foundation.dart' show kIsWeb; // <-- add this
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'dart:async';
+
+// Windy API key (keep private). Replace YOUR_REAL_WINDY_KEY with your key.
+const String kWindyApiKey = 'a4wqVgw3RBBPbjA0PjMtmD1I9PK0ndAX';
+
+enum WindProvider { openMeteo, windy }
 
 // OpenWeatherMap API key (replace with your OpenWeatherMap key).
 // Do NOT commit this value to a public repo.
@@ -210,7 +216,8 @@ double _parseCoord(String raw, {required bool isLat}) {
   // Extract numeric parts (deg, min, sec)
   final parts = RegExp(
     r'[-+]?\d+(\.\d+)?',
-  ).allMatches(s).map((m) => double.parse(m.group(0)!)).toList();
+  ).allMatches(s).map((m) => double.tryParse(m.group(0) ?? '') ?? 0.0).toList();
+  // ...existing code..
 
   double value;
   if (parts.isEmpty) return double.nan;
@@ -280,6 +287,20 @@ String _formatDms(double value, {required bool isLat}) {
 // ignore: unused_element
 String _formatTailOrHead(double w) =>
     '${w >= 0 ? 'Tailwind' : 'Headwind'} ${w.abs().toStringAsFixed(0)} kt';
+// unit helpers
+double kgToLbs(double kg) => kg * 2.2046226218;
+double lbsToKg(double lbs) => lbs / 2.2046226218;
+String formatWeight(double kg, bool isBell412, {int frac = 0}) => isBell412
+    ? '${kgToLbs(kg).toStringAsFixed(frac)} lbs'
+    : '${kg.toStringAsFixed(frac)} kg';
+
+// Safe conversion helper for dynamic/json numbers
+double _numToDouble(dynamic v) {
+  if (v == null) return 0.0;
+  if (v is num) return v.toDouble();
+  return double.tryParse(v.toString()) ?? 0.0;
+}
+
 // ...existing code...
 // convert pressure (hPa) -> approximate altitude (ft) using ISA barometric formula
 double pressureHpaToFeet(
@@ -315,6 +336,7 @@ void showCruiseResultsDialog({
   required double adjustedFuelBurn,
   required double hoistMinutesRounded,
   required double hoistFuel,
+  required double fuelRequired,
   double? aiAltitudeFt,
   double? aiTailwindKts,
   double? aiTailwindOutKts,
@@ -327,8 +349,22 @@ void showCruiseResultsDialog({
   double? destLat,
   double? destLon,
   bool roundTrip = true,
+  bool isBell412 = false,
 }) {
-  final int fuelRemRounded = fuelRemaining.round();
+  // Units shown to the user
+  final weightUnit = isBell412 ? 'lbs' : 'kg';
+  // Convert for display (internal calcs are in kg)
+  final displayHoistFuel = isBell412 ? kgToLbs(hoistFuel) : hoistFuel;
+  final displayAdjustedBurn = isBell412
+      ? kgToLbs(adjustedFuelBurn)
+      : adjustedFuelBurn;
+  final displayFuelRem = isBell412 ? kgToLbs(fuelRemaining) : fuelRemaining;
+  final displayFuelReq = isBell412 ? kgToLbs(fuelRequired) : fuelRequired;
+  final fuelRemRoundedDisplay = displayFuelRem.round();
+
+  // Color thresholds in display units (lbs for 412, kg for 139)
+  final redThresh = isBell412 ? kgToLbs(184) : 184.0;
+  final orangeThresh = isBell412 ? kgToLbs(456) : 456.0;
 
   showDialog(
     context: context,
@@ -368,22 +404,27 @@ void showCruiseResultsDialog({
                 Text(
                   'Hoist Time (rounded): ${hoistMinutesRounded.toStringAsFixed(0)} min',
                 ),
-                Text('Hoist Fuel: ${hoistFuel.toStringAsFixed(0)} kg'),
+                Text(
+                  'Hoist Fuel: ${displayHoistFuel.toStringAsFixed(0)} $weightUnit',
+                ),
 
                 Text(
-                  'Fuel Remaining: $fuelRemRounded kg',
+                  'Fuel Remaining: $fuelRemRoundedDisplay $weightUnit',
                   style: TextStyle(
-                    color: fuelRemRounded <= 184
+                    color: displayFuelRem <= redThresh
                         ? Colors.red
-                        : (fuelRemRounded <= 456
+                        : (displayFuelRem <= orangeThresh
                               ? Colors.orange
                               : Colors.white),
-                    fontWeight: fuelRemRounded <= 456
+                    fontWeight: displayFuelRem <= orangeThresh
                         ? FontWeight.bold
                         : FontWeight.normal,
                   ),
                 ),
 
+                Text(
+                  'Fuel Required: ${displayFuelReq.toStringAsFixed(0)} $weightUnit',
+                ),
                 Text('Required Torque: ${requiredTorque.ceil()} %'),
                 Text('Cruise Speed: ${cruiseSpeed.toStringAsFixed(0)} knots'),
                 Text('Altitude: ${altitude.toStringAsFixed(0)} ft'),
@@ -403,11 +444,11 @@ void showCruiseResultsDialog({
                     style: const TextStyle(color: Colors.white70),
                   ),
 
-                // AI suggestions
+                // ...existing code...
+                // AI suggestions (caller already guards non-null)
                 if (aiAltitudeFt != null && aiTailwindKts != null)
                   Text(
-                    'AI: Suggested altitude ~${aiAltitudeFt.toStringAsFixed(0)} ft '
-                    '(${_formatTailOrHead(aiTailwindKts)})',
+                    'AI: Suggested altitude ~${aiAltitudeFt.toStringAsFixed(0)} ft (${_formatTailOrHead(aiTailwindKts)})',
                     style: const TextStyle(color: Colors.cyanAccent),
                   ),
                 if (aiSuggestedAltitudeOutFt != null &&
@@ -422,16 +463,13 @@ void showCruiseResultsDialog({
                     'AI (Back): ~${aiSuggestedAltitudeBackFt.toStringAsFixed(0)} ft (${_formatTailOrHead(aiTailwindBackKts)})',
                     style: const TextStyle(color: Colors.cyanAccent),
                   ),
-                if (aiTailwindOutKts != null && aiTailwindBackKts != null)
-                  Text(
-                    'AI winds: ${_formatTailOrHead(aiTailwindOutKts)} (Out) | ${_formatTailOrHead(aiTailwindBackKts)} (Back)',
-                    style: const TextStyle(color: Colors.cyanAccent),
-                  ),
                 if (aiSuggestedIas != null)
                   Text(
                     'AI: Suggested cruise ≈ ${aiSuggestedIas.toStringAsFixed(0)} kts',
                     style: const TextStyle(color: Colors.cyanAccent),
                   ),
+                // ...existing code...
+                // ...existing code...
                 if (lowFuelWarning)
                   const Padding(
                     padding: EdgeInsets.only(top: 8),
@@ -444,16 +482,19 @@ void showCruiseResultsDialog({
                     ),
                   ),
 
+                // ...existing code...
                 const SizedBox(height: 12),
                 const Divider(thickness: 1, color: Colors.grey),
                 const SizedBox(height: 8),
 
+                // ...existing code...
                 // Charts row (horizontal scroll if narrow)
                 SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      // Torque
                       SizedBox(
                         width: 150,
                         child: Container(
@@ -475,6 +516,8 @@ void showCruiseResultsDialog({
                         ),
                       ),
                       const SizedBox(width: 10),
+
+                      // Fuel Burn
                       SizedBox(
                         width: 150,
                         child: Container(
@@ -486,21 +529,24 @@ void showCruiseResultsDialog({
                             border: Border.all(color: Colors.grey.shade700),
                           ),
                           child: swapAnimationCurvebuildMiniBarChart(
-                            title: 'Fuel Burn\n(kg/hr)',
-                            value: adjustedFuelBurn,
+                            title:
+                                'Fuel Burn\n(${isBell412 ? 'lbs/hr' : 'kg/hr'})',
+                            value: displayAdjustedBurn,
                             color: Colors.yellow,
                             maxY:
-                                ((adjustedFuelBurn <= 0
+                                (displayAdjustedBurn <= 0
                                         ? 100
-                                        : (adjustedFuelBurn / 100).ceil() *
-                                              100))
+                                        : (displayAdjustedBurn / 100).ceil() *
+                                              100)
                                     .toDouble(),
-                            unit: 'kg/hr',
+                            unit: isBell412 ? 'lbs/hr' : 'kg/hr',
                             height: 240,
                           ),
                         ),
                       ),
                       const SizedBox(width: 10),
+
+                      // Fuel Remaining
                       SizedBox(
                         width: 150,
                         child: Container(
@@ -512,15 +558,21 @@ void showCruiseResultsDialog({
                             border: Border.all(color: Colors.grey.shade700),
                           ),
                           child: swapAnimationCurvebuildMiniBarChart(
-                            title: 'Fuel\nRemaining (kg)',
-                            value: fuelRemaining,
-                            color: fuelRemRounded <= 184
+                            title:
+                                'Fuel\nRemaining (${isBell412 ? 'lbs' : 'kg'})',
+                            // Use display units and dynamic maxY to avoid clamping at 500
+                            value: displayFuelRem,
+                            color: displayFuelRem <= redThresh
                                 ? Colors.red
-                                : (fuelRemRounded <= 456
+                                : (displayFuelRem <= orangeThresh
                                       ? Colors.orange
                                       : Colors.green),
-                            maxY: 500,
-                            unit: 'kg',
+                            maxY:
+                                (displayFuelRem <= 0
+                                        ? 100
+                                        : (displayFuelRem / 100).ceil() * 100)
+                                    .toDouble(),
+                            unit: isBell412 ? 'lbs' : 'kg',
                             height: 240,
                           ),
                         ),
@@ -528,6 +580,8 @@ void showCruiseResultsDialog({
                     ],
                   ),
                 ),
+                // ...existing code...
+                // ...existing code...
               ],
             ),
           ),
@@ -536,6 +590,9 @@ void showCruiseResultsDialog({
     ),
   );
 }
+
+// Bell-412 loaded table: altitude -> oat -> ias -> burn (kg/hr)
+final Map<int, Map<int, Map<int, double>>> bh412Tables = {};
 
 final Map<int, Map<int, int>> fuelBurnTable0ft = {
   0: {50: 345, 60: 392, 80: 460, 90: 493, 100: 525},
@@ -850,6 +907,25 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   double? _aiTailwindBackKts;
   double? _aiSuggestedIas;
 
+  // Aircraft selection (default AW139). Add 'Bell 412' when you upload tables.
+  String _selectedAircraft = 'AW139';
+  static const List<String> kAircraftOptions = ['AW139', 'Bell 412'];
+
+  // Wind provider selection
+  WindProvider _windProvider = kWindyApiKey.isNotEmpty
+      ? WindProvider.windy
+      : WindProvider.openMeteo;
+  static const Map<WindProvider, String> _windProviderNames = {
+    WindProvider.windy: 'Windy (requires key)',
+    WindProvider.openMeteo: 'Open‑Meteo',
+  };
+
+  // Placeholder for Bell 412 speed-based fuel tables.
+  // Structure expected: { altitudeFt: { oatC: { iasKts: burnKgPerHr, ... }, ... }, ... }
+  // Fill this map by uploading CSV/JSON or pasting tables and I'll implement loader/interpolator.
+  // ignore: unused_field
+  final Map<int, Map<int, Map<int, double>>> _bh412SpeedBurnTables = {};
+
   double interpolateWind(double windSpeed) {
     // Example logic — adjust as needed
     return windSpeed * 0.85;
@@ -1007,9 +1083,14 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   }
   // _interpolateWind implementation moved to class scope above
 
+  // ...existing code...
   @override
   void initState() {
     super.initState();
+    // load BH412 performance table (safe to call even if asset missing)
+    loadBh412TablesFromAsset();
+
+    // existing controller initialisation
     cruiseSpeedController.text = cruiseSpeed.toStringAsFixed(0);
     missionDistanceController.text = missionDistance.toStringAsFixed(0);
     altitudeController.text = altitude.toStringAsFixed(0);
@@ -1017,6 +1098,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     fuelController.text = fuelOnboard.toStringAsFixed(0);
     hoistTimeController.text = extraHoistMinutes.toStringAsFixed(0);
   }
+  // ...existing code...
 
   @override
   void dispose() {
@@ -1243,6 +1325,37 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6.0),
+                    child: Row(
+                      children: [
+                        const Text(
+                          'Aircraft: ',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        const SizedBox(width: 8),
+                        DropdownButton<String>(
+                          value: _selectedAircraft,
+                          dropdownColor: kPanelColor,
+                          items: kAircraftOptions
+                              .map(
+                                (s) => DropdownMenuItem(
+                                  value: s,
+                                  child: Text(
+                                    s,
+                                    style: const TextStyle(color: Colors.white),
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: (v) {
+                            if (v == null) return;
+                            setState(() => _selectedAircraft = v);
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
                   buildInputField(
                     'Cruise Speed (knots)',
                     cruiseSpeedController,
@@ -1258,7 +1371,10 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     readOnly: useWindsAloft && autoApplyAi,
                   ),
                   buildInputField('Temperature (°C)', temperatureController),
-                  buildInputField('Fuel Onboard (kg)', fuelController),
+                  buildInputField(
+                    "Fuel Onboard (${_selectedAircraft == 'Bell 412' ? 'lbs' : 'kg'})",
+                    fuelController,
+                  ),
                   buildInputField('Hoist Time (min)', hoistTimeController),
 
                   // --- 4 toggles placed here ---
@@ -1303,6 +1419,44 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
+                  // Wind provider selector (styled to match other controls)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6.0),
+                    child: Row(
+                      children: [
+                        const Text(
+                          'Wind Provider: ',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        const SizedBox(width: 8),
+                        DropdownButton<WindProvider>(
+                          value: _windProvider,
+                          dropdownColor: kPanelColor,
+                          items: _windProviderNames.entries
+                              .map(
+                                (entry) => DropdownMenuItem(
+                                  value: entry.key,
+                                  child: Text(
+                                    entry.value,
+                                    style: const TextStyle(color: Colors.white),
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: (v) {
+                            if (v != null) setState(() => _windProvider = v);
+                          },
+                        ),
+                        const SizedBox(width: 8),
+                        if (_windProvider == WindProvider.windy &&
+                            kWindyApiKey.isEmpty)
+                          const Text(
+                            '(set kWindyApiKey in code)',
+                            style: TextStyle(color: Colors.orangeAccent),
+                          ),
+                      ],
+                    ),
+                  ),
                   SwitchListTile(
                     title: const Text('Show Mission Map & Weather'),
                     value: showMap,
@@ -1346,14 +1500,14 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                     ),
                                     // Uses kOpenWeatherApiKey constant defined at top of file
                                     Opacity(
-                                      opacity: 0.6,
+                                      opacity: 0.7,
                                       child: TileLayer(
                                         urlTemplate:
                                             'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
                                       ),
                                     ),
                                     Opacity(
-                                      opacity: 0.8,
+                                      opacity: 0.9,
                                       child: TileLayer(
                                         urlTemplate:
                                             'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
@@ -1902,23 +2056,23 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                             const SizedBox(height: 4),
                             if (_aiSuggestedIas != null)
                               Text(
-                                'Suggested IAS: ${_aiSuggestedIas!.toStringAsFixed(0)} kt',
+                                'Suggested IAS: ${_aiSuggestedIas?.toStringAsFixed(0) ?? '--'} kt',
                                 style: const TextStyle(color: Colors.white),
                               ),
                             if (_aiSuggestedAltitudeFt != null)
                               Text(
-                                'Suggested Altitude: ${_aiSuggestedAltitudeFt!.toStringAsFixed(0)} ft',
+                                'Suggested Altitude: ${_aiSuggestedAltitudeFt?.toStringAsFixed(0) ?? '--'} ft',
                                 style: const TextStyle(color: Colors.white),
                               ),
                             // show per‑leg suggested altitudes when available (prevents unused-field warnings)
                             if (_aiSuggestedAltitudeOutFt != null)
                               Text(
-                                'Suggested Out Altitude: ${_aiSuggestedAltitudeOutFt!.toStringAsFixed(0)} ft',
+                                'Suggested Out Altitude: ${_aiSuggestedAltitudeOutFt?.toStringAsFixed(0) ?? '--'} ft',
                                 style: const TextStyle(color: Colors.white70),
                               ),
                             if (_aiSuggestedAltitudeBackFt != null)
                               Text(
-                                'Suggested Back Altitude: ${_aiSuggestedAltitudeBackFt!.toStringAsFixed(0)} ft',
+                                'Suggested Back Altitude: ${_aiSuggestedAltitudeBackFt?.toStringAsFixed(0) ?? '--'} ft',
                                 style: const TextStyle(color: Colors.white70),
                               ),
                             if (_aiTailwindOutKts != null &&
@@ -2044,10 +2198,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     ],
                   ),
                   // ...existing code...
+                  // ...existing code...
                   ElevatedButton.icon(
                     icon: const Icon(Icons.air),
                     label: const Text('Show Winds Aloft'),
                     onPressed: () async {
+                      // parse coords
                       final originLat = _parseCoord(
                         originLatController.text,
                         isLat: true,
@@ -2064,30 +2220,18 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         destLonController.text,
                         isLat: false,
                       );
-                      final hLat = _parseCoord(
-                        hospitalLatController.text,
-                        isLat: true,
-                      );
-                      final hLon = _parseCoord(
-                        hospitalLonController.text,
-                        isLat: false,
-                      );
-                      final w1Lat = _parseCoord(
-                        waypoint1LatController.text,
-                        isLat: true,
-                      );
-                      final w1Lon = _parseCoord(
-                        waypoint1LonController.text,
-                        isLat: false,
-                      );
-                      final w2Lat = _parseCoord(
-                        waypoint2LatController.text,
-                        isLat: true,
-                      );
-                      final w2Lon = _parseCoord(
-                        waypoint2LonController.text,
-                        isLat: false,
-                      );
+
+                      if (!(originLat.isFinite && originLon.isFinite)) {
+                        // nothing to fetch
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Enter valid origin coordinates first',
+                            ),
+                          ),
+                        );
+                        return;
+                      }
 
                       final trackDeg =
                           (originLat.isFinite &&
@@ -2102,7 +2246,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                             )
                           : 0.0;
 
-                      if (originLat.isFinite && originLon.isFinite) {
+                      // Fetch origin winds (and destination if valid) and store copies for the dialog
+                      try {
                         await fetchAiAltitudeSuggestion(
                           lat: originLat,
                           lon: originLon,
@@ -2110,47 +2255,24 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                           storeKey: 'origin',
                         );
                         _departureWindsAloft = _aiWindsAloft;
+                        if (destLat.isFinite && destLon.isFinite) {
+                          await fetchAiAltitudeSuggestion(
+                            lat: destLat,
+                            lon: destLon,
+                            trackDeg: trackDeg,
+                            storeKey: 'dest',
+                          );
+                          _destinationWindsAloft = _aiWindsAloft;
+                        }
+                      } catch (e) {
+                        if (kDebugMode) debugPrint('ShowWinds fetch error: $e');
                       }
-                      if (destLat.isFinite && destLon.isFinite) {
-                        await fetchAiAltitudeSuggestion(
-                          lat: destLat,
-                          lon: destLon,
-                          trackDeg: trackDeg,
-                          storeKey: 'dest',
-                        );
-                        _destinationWindsAloft = _aiWindsAloft;
-                      }
-                      if (useHospitalWaypoint &&
-                          hLat.isFinite &&
-                          hLon.isFinite) {
-                        await fetchAiAltitudeSuggestion(
-                          lat: hLat,
-                          lon: hLon,
-                          trackDeg: trackDeg,
-                          storeKey: 'hospital',
-                        );
-                      }
-                      if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
-                        await fetchAiAltitudeSuggestion(
-                          lat: w1Lat,
-                          lon: w1Lon,
-                          trackDeg: trackDeg,
-                          storeKey: 'wpt1',
-                        );
-                      }
-                      if (useWaypoint2 && w2Lat.isFinite && w2Lon.isFinite) {
-                        await fetchAiAltitudeSuggestion(
-                          lat: w2Lat,
-                          lon: w2Lon,
-                          trackDeg: trackDeg,
-                          storeKey: 'wpt2',
-                        );
-                      }
+                      // Safe to use context after awaits
+                      if (!context.mounted) return;
+                      // show dialog exactly like before (reuses buildProfileView already used in file)
 
-                      if (!mounted) return;
-                      // ignore: use_build_context_synchronously
+                      // show dialog exactly like before (reuses buildProfileView already used in file)
                       showDialog<void>(
-                        // ignore: use_build_context_synchronously
                         context: context,
                         builder: (BuildContext dialogContext) {
                           Widget buildProfileView(
@@ -2183,76 +2305,104 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                     fontWeight: FontWeight.bold,
                                   ),
                                 ),
-                                const SizedBox(height: 6),
+                                const SizedBox(height: 8),
                                 for (final e in entries)
-                                  Text(
-                                    '${e.key} ft (${e.value['pressure'] ?? '--'} hPa): raw ${(((e.value['rawSpeedMps'] ?? 0) as num).toDouble() * 1.94384449).toStringAsFixed(1)} kt @ ${(((e.value['dir'] ?? 0) as num).toDouble()).toStringAsFixed(0)}° — ${_formatTailOrHead((((e.value['tailwind'] ?? 0) as num).toDouble()))}',
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 2,
+                                    ),
+                                    child: Text(
+                                      '${e.key} ft (${e.value['pressure'] ?? '--'} hPa): raw ${(_numToDouble(e.value['rawSpeedMps']) * 1.94384449).toStringAsFixed(1)} kt @ ${_numToDouble(e.value['dir']).toStringAsFixed(0)}° — ${_formatTailOrHead(_numToDouble(e.value['tailwind']))}',
+                                      style: const TextStyle(fontSize: 13),
+                                    ),
                                   ),
                                 const SizedBox(height: 8),
                                 const Text(
-                                  'Displayed altitudes: 2000 / 4000 / 6000 ft (interpolated from anchors)',
+                                  'Note: Anchors above are the raw API levels. Interpolated display altitudes are shown below.',
                                 ),
-                                const SizedBox(height: 6),
-                                for (final da in [2000, 4000, 6000])
-                                  Builder(
-                                    builder: (_) {
-                                      final value =
-                                          (_aiWindsAloft != null &&
-                                              _aiWindsAloft!.containsKey(da))
-                                          ? (((_aiWindsAloft![da]!['tailwind'] ??
-                                                        0)
-                                                    as num)
-                                                .toDouble())
-                                          : getOrInterpolateWind(da, {
-                                              for (final kv
-                                                  in (_aiWindsAloft ?? {})
-                                                      .entries)
-                                                kv.key:
-                                                    ((kv.value['tailwind'] ?? 0)
-                                                            as num)
-                                                        .toDouble(),
-                                            });
-                                      return Text(
-                                        '$da ft: ${value.toStringAsFixed(0)} kt',
-                                      );
-                                    },
-                                  ),
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 12,
+                                  runSpacing: 6,
+                                  children:
+                                      (entries.isNotEmpty
+                                              ? entries
+                                                    .map((e) => e.key)
+                                                    .toList()
+                                              : <int>[2000, 4000, 6000])
+                                          .map((da) {
+                                            final tailMap = {
+                                              for (final kv in profile.entries)
+                                                kv.key: _numToDouble(
+                                                  kv.value['tailwind'],
+                                                ),
+                                            };
+                                            final val = getOrInterpolateWind(
+                                              da,
+                                              tailMap,
+                                            );
+                                            return Chip(
+                                              backgroundColor: kPanelColor,
+                                              label: Text(
+                                                '$da ft: ${val.toStringAsFixed(0)} kt',
+                                              ),
+                                            );
+                                          })
+                                          .toList(),
+                                ),
                               ],
                             );
                           }
 
-                          return AlertDialog(
-                            title: const Text('Winds Aloft'),
-                            content: SingleChildScrollView(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  buildProfileView(
-                                    'Departure Winds Aloft',
-                                    _departureWindsAloft
-                                        as Map<int, Map<String, dynamic>>?,
+                          return Dialog(
+                            insetPadding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 12,
+                            ),
+                            child: SizedBox(
+                              width: 1000,
+                              height: 640,
+                              child: Padding(
+                                padding: const EdgeInsets.all(12),
+                                child: SingleChildScrollView(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'Winds Aloft',
+                                        style: Theme.of(
+                                          dialogContext,
+                                        ).textTheme.titleLarge,
+                                      ),
+                                      const SizedBox(height: 8),
+                                      buildProfileView(
+                                        'Departure Winds Aloft',
+                                        _departureWindsAloft,
+                                      ),
+                                      const SizedBox(height: 12),
+                                      buildProfileView(
+                                        'Destination Winds Aloft',
+                                        _destinationWindsAloft,
+                                      ),
+                                      const SizedBox(height: 12),
+                                      const Text(
+                                        'Surface = 10m wind. Press Close when done.',
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Align(
+                                        alignment: Alignment.centerRight,
+                                        child: TextButton(
+                                          onPressed: () =>
+                                              Navigator.of(dialogContext).pop(),
+                                          child: const Text('Close'),
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                  const SizedBox(height: 8),
-                                  buildProfileView(
-                                    'Destination Winds Aloft',
-                                    _destinationWindsAloft
-                                        as Map<int, Map<String, dynamic>>?,
-                                  ),
-                                  const SizedBox(height: 8),
-                                  const Text(
-                                    'Note: anchors show raw API speeds (knots). Displayed altitudes are interpolated when an exact anchor is not available.',
-                                  ),
-                                ],
+                                ),
                               ),
                             ),
-                            actions: [
-                              TextButton(
-                                onPressed: () =>
-                                    Navigator.of(dialogContext).pop(),
-                                child: const Text('Close'),
-                              ),
-                            ],
                           );
                         },
                       );
@@ -2260,17 +2410,15 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                   ),
 
                   // ...existing code...
-                  const SizedBox(height: 12),
-
-                  const SizedBox(height: 12),
                   Row(
                     children: [
                       Expanded(
                         child: OutlinedButton.icon(
                           onPressed: _lastReport == null
                               ? null
-                              : () =>
-                                    CruiseReportExporter.preview(_lastReport!),
+                              : () {
+                                  CruiseReportExporter.preview(_lastReport!);
+                                },
                           icon: const Icon(Icons.print),
                           label: const Text('PDF / Print'),
                         ),
@@ -2280,7 +2428,9 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         child: OutlinedButton.icon(
                           onPressed: _lastReport == null
                               ? null
-                              : () => CruiseReportExporter.share(_lastReport!),
+                              : () {
+                                  CruiseReportExporter.share(_lastReport!);
+                                },
                           icon: const Icon(Icons.share),
                           label: const Text('Share'),
                         ),
@@ -2291,11 +2441,27 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               ),
             ),
           );
+          // ...existing code...
+          // ...existing code...
           // local snapshot values for charts (avoid IIFE inside children)
+          final isBell412 = _selectedAircraft == 'Bell 412';
           final chartTorque = _lastRequiredTorque ?? 0;
-          final chartBurn = _lastAdjustedFuelBurn ?? 0;
-          final chartFuelRem = _lastFuelRemaining ?? 0;
 
+          // raw snapshots are in kg (internals)
+          final chartBurnRaw = _lastAdjustedFuelBurn ?? 0; // kg/hr
+          final chartFuelRemRaw = _lastFuelRemaining ?? 0; // kg
+
+          // convert to display units for charts
+          final chartBurn = isBell412 ? kgToLbs(chartBurnRaw) : chartBurnRaw;
+          final chartFuelRem = isBell412
+              ? kgToLbs(chartFuelRemRaw)
+              : chartFuelRemRaw;
+
+          // color thresholds in display units
+          final fuelRedThresh = isBell412 ? kgToLbs(184) : 184.0;
+          final fuelOrangeThresh = isBell412 ? kgToLbs(456) : 456.0;
+
+          // ...existing code...
           final chartsPanel = Padding(
             padding: const EdgeInsets.fromLTRB(8, 16, 16, 16),
             child: (_lastRequiredTorque == null)
@@ -2303,6 +2469,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                 : SingleChildScrollView(
                     child: Column(
                       children: [
+                        // Torque
                         Container(
                           margin: const EdgeInsets.only(bottom: 12),
                           padding: const EdgeInsets.all(8),
@@ -2320,6 +2487,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                             height: 320,
                           ),
                         ),
+                        // Fuel Burn
                         Container(
                           margin: const EdgeInsets.only(bottom: 12),
                           padding: const EdgeInsets.all(8),
@@ -2329,18 +2497,20 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                             border: Border.all(color: Colors.grey.shade700),
                           ),
                           child: swapAnimationCurvebuildMiniBarChart(
-                            title: 'Fuel Burn\n(kg/hr)',
+                            title:
+                                'Fuel Burn\n(${isBell412 ? 'lbs/hr' : 'kg/hr'})',
                             value: chartBurn,
                             color: Colors.yellow,
                             maxY:
-                                ((chartBurn <= 0
+                                (chartBurn <= 0
                                         ? 100
-                                        : (chartBurn / 100).ceil() * 100))
+                                        : (chartBurn / 100).ceil() * 100)
                                     .toDouble(),
-                            unit: 'kg/hr',
+                            unit: isBell412 ? 'lbs/hr' : 'kg/hr',
                             height: 320,
                           ),
                         ),
+                        // Fuel Remaining
                         Container(
                           margin: const EdgeInsets.only(bottom: 12),
                           padding: const EdgeInsets.all(8),
@@ -2350,15 +2520,20 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                             border: Border.all(color: Colors.grey.shade700),
                           ),
                           child: swapAnimationCurvebuildMiniBarChart(
-                            title: 'Fuel\nRemaining (kg)',
+                            title:
+                                'Fuel\nRemaining (${isBell412 ? 'lbs' : 'kg'})',
                             value: chartFuelRem,
-                            color: chartFuelRem <= 184
+                            color: chartFuelRem <= fuelRedThresh
                                 ? Colors.red
-                                : (chartFuelRem <= 456
+                                : (chartFuelRem <= fuelOrangeThresh
                                       ? Colors.orange
                                       : Colors.green),
-                            maxY: 500,
-                            unit: 'kg',
+                            maxY:
+                                (chartFuelRem <= 0
+                                        ? 100
+                                        : (chartFuelRem / 100).ceil() * 100)
+                                    .toDouble(),
+                            unit: isBell412 ? 'lbs' : 'kg',
                             height: 320,
                           ),
                         ),
@@ -2366,6 +2541,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     ),
                   ),
           );
+          // ...existing code...
 
           if (wide) {
             return Row(
@@ -2402,7 +2578,97 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     return {'speed': speed, 'dirFrom': dirFromDeg};
   }
 
-  // _interpolateWind implementation moved to class scope above
+  // Helper: lookup / interpolate Bell‑412 burn from loaded bh412Tables
+  // Bilinear in (altitude, OAT) and linear in IAS. Tables are lbs/hr.
+  double? _bh412GetBurn(int altitudeFt, int oatC, double iasKts) {
+    if (bh412Tables.isEmpty) return null;
+
+    // Bracket altitude
+    final altKeys = bh412Tables.keys.toList()..sort();
+    int a0 = altKeys.first, a1 = altKeys.last;
+    if (altitudeFt <= altKeys.first) {
+      a0 = altKeys.first;
+      a1 = a0;
+    } else if (altitudeFt >= altKeys.last) {
+      a0 = altKeys.last;
+      a1 = a0;
+    } else {
+      for (int i = 0; i < altKeys.length - 1; i++) {
+        if (altitudeFt >= altKeys[i] && altitudeFt <= altKeys[i + 1]) {
+          a0 = altKeys[i];
+          a1 = altKeys[i + 1];
+          break;
+        }
+      }
+    }
+
+    double interpIas(Map<int, double> row, double ias) {
+      if (row.isEmpty) return double.nan;
+      final sKeys = row.keys.toList()..sort();
+      int s0 = sKeys.first, s1 = sKeys.last;
+      if (ias <= sKeys.first) {
+        s0 = sKeys.first;
+        s1 = s0;
+      } else if (ias >= sKeys.last) {
+        s0 = sKeys.last;
+        s1 = s0;
+      } else {
+        for (int i = 0; i < sKeys.length - 1; i++) {
+          if (ias >= sKeys[i] && ias <= sKeys[i + 1]) {
+            s0 = sKeys[i];
+            s1 = sKeys[i + 1];
+            break;
+          }
+        }
+      }
+      final v0 = (row[s0] ?? 0).toDouble();
+      final v1 = (row[s1] ?? v0).toDouble();
+      if (s0 == s1) return v0;
+      final r = (ias - s0) / (s1 - s0);
+      return v0 + (v1 - v0) * r;
+    }
+
+    double burnAtAlt(int alt) {
+      final tempMap = bh412Tables[alt];
+      if (tempMap == null || tempMap.isEmpty) return double.nan;
+
+      // Bracket OAT
+      final tKeys = tempMap.keys.toList()..sort();
+      int t0 = tKeys.first, t1 = tKeys.last;
+      if (oatC <= tKeys.first) {
+        t0 = tKeys.first;
+        t1 = t0;
+      } else if (oatC >= tKeys.last) {
+        t0 = tKeys.last;
+        t1 = t0;
+      } else {
+        for (int i = 0; i < tKeys.length - 1; i++) {
+          if (oatC >= tKeys[i] && oatC <= tKeys[i + 1]) {
+            t0 = tKeys[i];
+            t1 = tKeys[i + 1];
+            break;
+          }
+        }
+      }
+
+      final row0 = Map<int, double>.from(tempMap[t0] ?? const <int, double>{});
+      final row1 = Map<int, double>.from(tempMap[t1] ?? const <int, double>{});
+      final b0 = interpIas(row0, iasKts);
+      final b1 = interpIas(row1, iasKts);
+      if (t0 == t1 || !b0.isFinite || !b1.isFinite) return b0;
+      final rt = (oatC - t0) / (t1 - t0);
+      return b0 + (b1 - b0) * rt;
+    }
+
+    final ba0 = burnAtAlt(a0);
+    final ba1 = burnAtAlt(a1);
+    if (a0 == a1 || !ba0.isFinite || !ba1.isFinite) {
+      return ba0.isFinite ? ba0 : ba1;
+    }
+
+    final ra = (altitudeFt - a0) / (a1 - a0);
+    return ba0 + (ba1 - ba0) * ra;
+  }
 
   // ---------- IAS Suggestion ----------
   Map<String, double>? suggestBestIas({
@@ -2412,12 +2678,22 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     required double tailwindBackKts,
     required double distanceNmOneWay,
   }) {
-    const candidates = [120, 125, 130, 135, 140, 145, 150, 155, 160];
+    // Use Bell-412 speed set when the user has selected that aircraft and we have tables.
+    final List<int> candidates =
+        (_selectedAircraft == 'Bell 412' && bh412Tables.isNotEmpty)
+        ? <int>[100, 105, 110, 115, 120, 125]
+        : <int>[120, 125, 130, 135, 140, 145, 150, 155, 160];
     double? bestFuel;
     Map<String, double>? best;
     for (final ias in candidates) {
-      final tq = getTorqueForIAS(altFt, oatC, ias.toDouble());
-      final burnPerHr = interpolateFuelBurn(tq, altFt, oatC);
+      double? burnPerHr;
+      if (_selectedAircraft == 'Bell 412' && bh412Tables.isNotEmpty) {
+        burnPerHr = _bh412GetBurn(altFt, oatC, ias.toDouble());
+        if (burnPerHr == null) continue;
+      } else {
+        final tq = getTorqueForIAS(altFt, oatC, ias.toDouble());
+        burnPerHr = interpolateFuelBurn(tq, altFt, oatC);
+      }
       final gsOut = (ias + tailwindOutKts).clamp(30, 220);
       final gsBack = (ias + tailwindBackKts).clamp(30, 220);
       final timeOut = distanceNmOneWay / gsOut;
@@ -2432,6 +2708,40 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     return best;
   }
 
+  // Load CSV (assets/performance_tables/bell_412.csv) into bh412Tables.
+  // Expected CSV columns: altitude,oat,ias,burn
+  Future<void> loadBh412TablesFromAsset() async {
+    try {
+      final s = await rootBundle.loadString(
+        'assets/performance_tables/bell_412.csv',
+      );
+      final lines = s
+          .split(RegExp(r'[\r\n]+'))
+          .map((l) => l.trim())
+          .where((l) => l.isNotEmpty)
+          .toList();
+      for (final ln in lines) {
+        if (ln.startsWith('#')) continue;
+        if (ln.toLowerCase().startsWith('altitude')) continue;
+        final cols = ln.split(',').map((c) => c.trim()).toList();
+        if (cols.length < 4) continue;
+        final alt = int.tryParse(cols[0]);
+        final oat = int.tryParse(cols[1]);
+        final ias = int.tryParse(cols[2]);
+        final burn = double.tryParse(cols[3]);
+        if (alt == null || oat == null || ias == null || burn == null) continue;
+        bh412Tables.putIfAbsent(alt, () => {});
+        bh412Tables[alt]!.putIfAbsent(oat, () => {});
+        bh412Tables[alt]![oat]![ias] = burn;
+      }
+      // ignore: avoid_print
+      print('BH412: loaded ${bh412Tables.length} altitude rows');
+    } catch (e) {
+      // ignore: avoid_print
+      print('BH412 load error: $e');
+    }
+  }
+
   // ...existing code...
   Future<void> fetchAiAltitudeSuggestion({
     required double lat,
@@ -2439,107 +2749,222 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     required double trackDeg,
     String? storeKey, // optional key to keep the fetched profile
   }) async {
-    final uri = Uri.parse(
-      'https://api.open-meteo.com/v1/forecast'
-      '?latitude=$lat&longitude=$lon'
-      '&hourly=wind_speed_925hPa,wind_direction_925hPa,'
-      'wind_speed_850hPa,wind_direction_850hPa,'
-      'wind_speed_700hPa,wind_direction_700hPa'
-      '&forecast_days=1',
-    );
-
     try {
-      final res = await http.get(uri);
-      if (res.statusCode != 200) return;
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      final h = data['hourly'] as Map<String, dynamic>;
+      Map<String, dynamic>? raw;
+      // desired levels: surface + pressure levels (strings for Windy, ints for others)
+      final desiredLevels = ['sfc', '950', '925', '900', '850', '800', '700'];
 
-      final sp925 = (h['wind_speed_925hPa']?[0] ?? 0).toDouble();
-      final dr925 = (h['wind_direction_925hPa']?[0] ?? 0).toDouble();
-      final sp850 = (h['wind_speed_850hPa']?[0] ?? 0).toDouble();
-      final dr850 = (h['wind_direction_850hPa']?[0] ?? 0).toDouble();
-      final sp700 = (h['wind_speed_700hPa']?[0] ?? 0).toDouble();
-      final dr700 = (h['wind_direction_700hPa']?[0] ?? 0).toDouble();
-
-      // compute approximate geopotential heights for the pressure levels (ft)
-      final alt925 = pressureHpaToFeet(925).round();
-      final alt850 = pressureHpaToFeet(850).round();
-      final alt700 = pressureHpaToFeet(700).round();
-
-      final tailAt925 = _tailwindKts(sp925, dr925, trackDeg);
-      final tailAt850 = _tailwindKts(sp850, dr850, trackDeg);
-      final tailAt700 = _tailwindKts(sp700, dr700, trackDeg);
-
-      // ...existing code...
-      _aiWindsAloft = {
-        alt925: {
-          'tailwind': tailAt925,
-          'dir': dr925,
-          'pressure': 925,
-          'rawSpeedMps': sp925,
-        },
-        alt850: {
-          'tailwind': tailAt850,
-          'dir': dr850,
-          'pressure': 850,
-          'rawSpeedMps': sp850,
-        },
-        alt700: {
-          'tailwind': tailAt700,
-          'dir': dr700,
-          'pressure': 700,
-          'rawSpeedMps': sp700,
-        },
-      };
-      // ...existing code...
-      // DEBUG: show values in knots so you can compare anchors vs interpolation
-      // ignore: avoid_print
-      print(
-        'RAW_WINDS_KTS: 925=${(sp925 * 1.94384449).toStringAsFixed(1)} kt @${alt925}ft, '
-        '850=${(sp850 * 1.94384449).toStringAsFixed(1)} kt @${alt850}ft, '
-        '700=${(sp700 * 1.94384449).toStringAsFixed(1)} kt @${alt700}ft',
-      );
-      final aiWindsStr =
-          _aiWindsAloft?.entries
-              .map(
-                (e) =>
-                    '${e.key}ft:${(e.value['tailwind'])?.toStringAsFixed(1) ?? '--'}kt/${(e.value['dir'])?.toStringAsFixed(0) ?? '--'}°',
-              )
-              .join(' | ') ??
-          'none';
-      // ignore: avoid_print
-      print('AI_WINDS_ALOFT: $aiWindsStr');
-      // ...existing code...
-
-      // Base anchor levels for interpolation / map markers -- use computed geopotential heights
-      final baseLevels = <Map<String, double>>[
-        {'alt': alt925.toDouble(), 'speed': sp925, 'dirFrom': dr925},
-        {'alt': alt850.toDouble(), 'speed': sp850, 'dirFrom': dr850},
-        {'alt': alt700.toDouble(), 'speed': sp700, 'dirFrom': dr700},
-      ];
-      // ...existing code...
-      // DEBUG: raw wind speeds (m/s) from API for quick inspection
-      // ignore: avoid_print
-      print(
-        'RAW_WINDS: sp925=${sp925.toStringAsFixed(2)} m/s, sp850=${sp850.toStringAsFixed(2)} m/s, sp700=${sp700.toStringAsFixed(2)} m/s',
-      );
-
-      // optionally persist the fetched profile for later rendering on the map
-      if (storeKey != null) {
-        _fetchedWindLevelsByKey[storeKey] = baseLevels;
-        // DEBUG: confirm stored profile
-        // ignore: avoid_print
-        print(
-          'WIND_PROFILE_STORED: $storeKey -> ${baseLevels.map((m) => 'alt=${m['alt']},spd=${m['speed']},dir=${m['dirFrom']}').join('; ')}',
+      if (_windProvider == WindProvider.windy && kWindyApiKey.isNotEmpty) {
+        final windyLevels = desiredLevels.where((l) => l != 'sfc').join(',');
+        final windyUri = Uri.parse(
+          'https://api.windy.com/api/point-forecast/v2'
+          '?lat=$lat&lon=$lon&model=gfs&levels=$windyLevels&parameters=wind',
         );
+        final windyRes = await http.get(
+          windyUri,
+          headers: {'x-windy-key': kWindyApiKey, 'Accept': 'application/json'},
+        );
+        if (windyRes.statusCode == 200) {
+          final wd = jsonDecode(windyRes.body) as Map<String, dynamic>;
+          raw = {'provider': 'windy', 'data': wd};
+          if (kDebugMode) debugPrint('RAW_WINDY: $raw');
+        } else {
+          // ignore: avoid_print
+          print(
+            'WINDY_FAIL status=${windyRes.statusCode}; falling back to Open‑Meteo',
+          );
+        }
       }
 
-      // Use the API-provided anchor altitudes as the candidates so AI suggests
-      // one of the actual pressure-level heights instead of arbitrary fixed levels.
-      final anchors = [alt925, alt850, alt700].map((v) => v.toDouble()).toList()
-        ..sort();
+      if (raw == null) {
+        // Open‑Meteo fallback (request surface + the pressure levels we care about)
+        final omParams = StringBuffer()
+          ..write('&forecast_days=1')
+          ..write('&hourly=')
+          // surface winds (10m)
+          ..write('windspeed_10m,winddirection_10m');
+        for (final lvl in desiredLevels) {
+          if (lvl == 'sfc') continue;
+          omParams.write(',wind_speed_${lvl}hPa,wind_direction_${lvl}hPa');
+        }
+        final uri = Uri.parse(
+          'https://api.open-meteo.com/v1/forecast'
+          '?latitude=$lat&longitude=$lon'
+          '${omParams.toString()}',
+        );
+        final res = await http.get(uri);
+        if (res.statusCode != 200) return;
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        raw = {'provider': 'openMeteo', 'data': data};
+        if (kDebugMode) debugPrint('RAW_OPENMETEO: $raw');
+      }
 
-      // include each anchor ±1000 and ±2000 ft and also a 500ft step scan between min/max
+      // normalize generically into level -> (speed m/s, dirFrom)
+      final Map<int, Map<String, double>> profile = {};
+
+      if (raw['provider'] == 'windy') {
+        final wd = raw['data'] as Map<String, dynamic>;
+        final levels = (wd['levels'] is Map)
+            ? wd['levels'] as Map<String, dynamic>
+            : <String, dynamic>{};
+        if (levels.isEmpty) {
+          if (kDebugMode) {
+            debugPrint('WINDY: no levels key found in response: ${wd.keys}');
+          }
+        }
+
+        // Use whatever level keys Windy returned (robust to 'sfc', numeric strings, or other names)
+        final available = levels.keys.toList();
+        // Try to sort numerically when possible, keeping 'sfc' first
+        available.sort((a, b) {
+          if (a == 'sfc') return -1;
+          if (b == 'sfc') return 1;
+          final ai = int.tryParse(a) ?? 0;
+          final bi = int.tryParse(b) ?? 0;
+          return ai.compareTo(bi);
+        });
+
+        for (final lvl in available) {
+          try {
+            final entry = levels[lvl] as Map<String, dynamic>?;
+            if (entry == null) continue;
+
+            // Wind may be nested under 'wind' or present as top-level fields; try common names.
+            Map<String, dynamic>? windMap = entry['wind'] is Map
+                ? entry['wind'] as Map<String, dynamic>
+                : null;
+            double sp = 0.0;
+            double dir = 0.0;
+            if (windMap != null) {
+              sp = _numToDouble(
+                windMap['speed'] ?? windMap['wind_speed'] ?? windMap['ws'],
+              );
+              dir = _numToDouble(
+                windMap['direction'] ??
+                    windMap['dir'] ??
+                    windMap['wind_direction'],
+              );
+            } else {
+              // fallback to common top-level keys
+              sp = _numToDouble(
+                entry['speed'] ?? entry['wind_speed'] ?? entry['windSpeed'],
+              );
+              dir = _numToDouble(
+                entry['direction'] ?? entry['dir'] ?? entry['wind_direction'],
+              );
+            }
+            if (sp == 0 && dir == 0) continue;
+
+            final pressure = (lvl == 'sfc') ? 0 : int.tryParse(lvl) ?? 0;
+            final altFt = (pressure == 0)
+                ? 0
+                : pressureHpaToFeet(pressure.toDouble()).round();
+            profile[altFt] = {
+              'tailwind': _tailwindKts(sp, dir, trackDeg),
+              'dir': dir,
+              'pressure': pressure.toDouble(),
+              'rawSpeedMps': sp,
+            };
+          } catch (e) {
+            if (kDebugMode) debugPrint('WINDY parse error for level $lvl: $e');
+            continue;
+          }
+        }
+      } else {
+        final data = raw['data'] as Map<String, dynamic>;
+        final h = (data['hourly'] ?? {}) as Map<String, dynamic>;
+
+        // surface first (handle either naming: windspeed_10m or wind_speed_10m)
+        final sSp = _numToDouble(
+          h['windspeed_10m'] != null
+              ? (h['windspeed_10m']?[0])
+              : (h['wind_speed_10m']?[0]),
+        );
+        final sDr = _numToDouble(
+          h['winddirection_10m'] != null
+              ? (h['winddirection_10m']?[0])
+              : (h['wind_direction_10m']?[0]),
+        );
+        if (sSp != 0 || sDr != 0) {
+          profile[0] = {
+            'tailwind': _tailwindKts(sSp, sDr, trackDeg),
+            'dir': sDr,
+            'pressure': 0.0,
+            'rawSpeedMps': sSp,
+          };
+        }
+
+        // Discover which pressure-level keys the API actually returned (robust to missing levels)
+        final presentLevels = <int>{};
+        for (final k in h.keys) {
+          final m = RegExp(r'wind_speed_(\d+)hPa').firstMatch(k);
+          if (m != null) {
+            final p = int.tryParse(m.group(1) ?? '');
+            if (p != null) presentLevels.add(p);
+          }
+        }
+
+        // Build ordered list of levels to use: prefer discovered presentLevels, else fallback to desiredLevels
+        final levelsToUse = <String>[];
+        if (presentLevels.isNotEmpty) {
+          final sorted = presentLevels.toList()..sort();
+          for (final p in sorted) {
+            levelsToUse.add(p.toString());
+          }
+        } else {
+          // no discovered levels — fall back to configured desiredLevels (this keeps prior behaviour)
+          levelsToUse.addAll(desiredLevels.where((l) => l != 'sfc'));
+        }
+
+        for (final lvl in levelsToUse) {
+          final keySp = 'wind_speed_${lvl}hPa';
+          final keyDr = 'wind_direction_${lvl}hPa';
+          final spArr = h[keySp];
+          final drArr = h[keyDr];
+          final spRaw = (spArr is List && spArr.isNotEmpty)
+              ? _numToDouble(spArr[0])
+              : _numToDouble(spArr);
+          // Open-Meteo returns km/h, convert to m/s for all wind_speed_*hPa keys
+          final sp = spRaw / 3.6;
+          final dr = (drArr is List && drArr.isNotEmpty)
+              ? _numToDouble(drArr[0])
+              : _numToDouble(drArr);
+
+          if (sp == 0 && dr == 0) continue;
+          final pressure = int.tryParse(lvl) ?? 0;
+          final altFt = pressure == 0
+              ? 0
+              : pressureHpaToFeet(pressure.toDouble()).round();
+          profile[altFt] = {
+            'tailwind': _tailwindKts(sp, dr, trackDeg),
+            'dir': dr,
+            'pressure': pressure.toDouble(),
+            'rawSpeedMps': sp,
+          };
+        }
+      }
+      // ...existing code...
+
+      if (profile.isEmpty) return;
+
+      // store normalized profile
+      _aiWindsAloft = profile;
+
+      // optional persist per-storeKey
+      if (storeKey != null) {
+        final baseLevels = profile.entries.map((e) {
+          return {
+            'alt': e.key.toDouble(),
+            'speed': (e.value['rawSpeedMps'] ?? 0),
+            'dirFrom': (e.value['dir'] ?? 0),
+          };
+        }).toList();
+        _fetchedWindLevelsByKey[storeKey] = baseLevels;
+      }
+
+      // Use profile keys (altitudes in ft) as anchors for candidate generation
+      final anchors = profile.keys.map((k) => k.toDouble()).toList()..sort();
+
       final candSet = <int>{};
       for (final a in anchors) {
         final ai = a.toInt();
@@ -2549,13 +2974,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         candSet.add(ai + 1000);
         candSet.add(ai + 2000);
       }
-      // also add a dense scan every 500 ft between lowest-2000 and highest+2000
       final minA = anchors.first.toInt() - 2000;
       final maxA = anchors.last.toInt() + 2000;
       for (int a = (minA ~/ 500) * 500; a <= maxA; a += 500) {
         candSet.add(a);
       }
-      // clamp sensible bounds and remove non-positive
+
       final candidateAltitudes =
           candSet
               .map((v) => v.clamp(500, 20000))
@@ -2564,7 +2988,31 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               .toList()
             ..sort();
 
-      // finer IAS candidates so we don't miss an IAS that pairs well with a particular leg wind
+      // Evaluate candidates using existing logic (reuse _aiWindsAloft -> baseLevels)
+      final baseLevels =
+          _aiWindsAloft?.entries.map((e) {
+            return {
+              'alt': e.key.toDouble(),
+              'speed': _numToDouble(e.value['rawSpeedMps']),
+              'dirFrom': _numToDouble(e.value['dir']),
+            };
+          }).toList() ??
+          [];
+
+      // existing evaluation loop follows (keeps prior logic unchanged)
+      double? bestSingleAlt;
+      double? bestSingleFuel;
+      double? bestSingleIas;
+      double? bestSingleOut;
+      double? bestSingleBack;
+
+      double? bestOutAlt;
+      double? bestOutFuel;
+      double? bestOutIas;
+      double? bestBackAlt;
+      double? bestBackFuel;
+      double? bestBackIas;
+
       const candidateIas = [
         110,
         115,
@@ -2579,33 +3027,15 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         160,
         165,
       ];
-      // ...existing code...
 
-      // best single-alt (combined outback) — original behaviour
-      double? bestSingleAlt;
-      double? bestSingleFuel;
-      double? bestSingleIas;
-      double? bestSingleOut;
-      double? bestSingleBack;
-
-      // best per-leg (out and back separately)
-      double? bestOutAlt;
-      double? bestOutFuel;
-      double? bestOutIas;
-      double? bestBackAlt;
-      double? bestBackFuel;
-      double? bestBackIas;
-
-      // ...existing code...
       for (final alt in candidateAltitudes) {
         final tails = _tailOutBack(alt, trackDeg, baseLevels);
         final outTail = tails['out']!;
         final backTail = tails['back']!;
 
-        // combined (single-alt) using existing function
         final opt = suggestBestIas(
           altFt: alt.toInt(),
-          oatC: temperature.toInt(),
+          oatC: (temperature).toInt(),
           tailwindOutKts: outTail,
           tailwindBackKts: backTail,
           distanceNmOneWay: missionDistance,
@@ -2621,7 +3051,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           }
         }
 
-        // best IAS for this altitude for OUT leg only
         double? bestFuelForThisOut;
         double? bestIasForThisOut;
         for (final ias in candidateIas) {
@@ -2651,7 +3080,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           }
         }
 
-        // best IAS for this altitude for BACK leg only
         double? bestFuelForThisBack;
         double? bestIasForThisBack;
         for (final ias in candidateIas) {
@@ -2682,38 +3110,35 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         }
       }
 
-      // compare combined separate-alt fuel vs best single-alt fuel
-      double? combinedSeparateFuel;
-      if (bestOutFuel != null && bestBackFuel != null) {
-        combinedSeparateFuel = bestOutFuel + bestBackFuel;
-      }
-      // Keep both suggestions so UI can present choices
+      double? combinedSeparateFuel =
+          (bestOutFuel != null && bestBackFuel != null)
+          ? (bestOutFuel + bestBackFuel)
+          : null;
+
       double? chosenOutTail;
       double? chosenBackTail;
       double? chosenSingleAlt = bestSingleAlt;
       double? chosenSingleOut = bestSingleOut;
       double? chosenSingleBack = bestSingleBack;
 
-      // choose which tailwinds to show as _aiTailwindOutKts/_aiTailwindBackKts:
       if (combinedSeparateFuel != null &&
           bestSingleFuel != null &&
           combinedSeparateFuel < bestSingleFuel) {
-        // separate-alt approach is better
         if (bestOutAlt != null) {
-          final tails = _tailOutBack(bestOutAlt, trackDeg, baseLevels);
-          chosenOutTail = tails['out']!;
+          chosenOutTail = _tailOutBack(bestOutAlt, trackDeg, baseLevels)['out'];
         }
-        if (bestBackAlt != null) {
-          final tails = _tailOutBack(bestBackAlt, trackDeg, baseLevels);
-          chosenBackTail = tails['back']!;
-        }
+      }
+      if (bestBackAlt != null) {
+        chosenBackTail = _tailOutBack(
+          bestBackAlt,
+          trackDeg,
+          baseLevels,
+        )['back'];
       } else {
-        // single-alt approach or fallback
         chosenOutTail = chosenSingleOut;
         chosenBackTail = chosenSingleBack;
       }
 
-      // assign to state (store both single and per-leg alt suggestions)
       if (mounted) {
         setState(() {
           _aiSuggestedAltitudeFt = chosenSingleAlt;
@@ -2727,14 +3152,15 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               : null;
         });
       }
-      // DEBUG: show what the AI considered and which approach won
+
       // ignore: avoid_print
       print(
         'AI_CHOICE: singleAlt=$chosenSingleAlt singleFuel=$bestSingleFuel outAlt=$bestOutAlt outFuel=$bestOutFuel backAlt=$bestBackAlt backFuel=$bestBackFuel combinedSeparateFuel=$combinedSeparateFuel',
       );
-      // ...existing code...
-    } catch (_) {
+    } catch (e) {
       // ignore network / parse errors silently
+      // ignore: avoid_print
+      print('fetchAiAltitudeSuggestion error: $e');
     }
   }
   // ...existing code...
@@ -2758,14 +3184,24 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   Future<void> calculateCruise({bool roundTrip = true}) async {
     // Parse inputs
     cruiseSpeed = _parseNumber(cruiseSpeedController.text);
+    // ensure missionDistance reads from the input field unless auto-calculated later
+    missionDistance = _parseNumber(missionDistanceController.text);
     altitude = _parseNumber(altitudeController.text);
     temperature = _parseNumber(temperatureController.text);
     fuelOnboard = _parseNumber(fuelController.text);
+    // if Bell 412 selected, user enters lbs -> convert to kg for internal calcs
+    if (_selectedAircraft == 'Bell 412') {
+      fuelOnboard = lbsToKg(fuelOnboard);
+    }
     extraHoistMinutes = _parseNumber(hoistTimeController.text);
 
     // Input validation
     if (!cruiseSpeed.isFinite || cruiseSpeed <= 0) {
       cruiseSpeed = 1;
+    }
+    if (!missionDistance.isFinite || missionDistance <= 0) {
+      missionDistance = 1; // prevent zero-distance calculations
+      missionDistanceController.text = missionDistance.toStringAsFixed(0);
     }
     if (!fuelOnboard.isFinite || fuelOnboard < 0) {
       fuelOnboard = 0;
@@ -2789,7 +3225,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     );
 
     // Parse coordinates
-    // ...existing code...
     final originLat = _parseCoord(originLatController.text, isLat: true);
     final originLon = _parseCoord(originLonController.text, isLat: false);
     final w1Lat = _parseCoord(waypoint1LatController.text, isLat: true);
@@ -2799,35 +3234,37 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     final hLat = _parseCoord(hospitalLatController.text, isLat: true);
     final hLon = _parseCoord(hospitalLonController.text, isLat: false);
 
-    // Build ordered sequence: Origin -> Hospital (if used) -> Waypoint1 (if used) -> Destination
-    double totalDistance = 0.0;
-    final seq = <LatLng>[];
-    if (originLat.isFinite && originLon.isFinite) {
-      seq.add(LatLng(originLat, originLon));
-    }
-    if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
-      seq.add(LatLng(hLat, hLon));
-    }
-    if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
-      seq.add(LatLng(w1Lat, w1Lon));
-    }
-    if (destLat.isFinite && destLon.isFinite) {
-      seq.add(LatLng(destLat, destLon));
-    }
-
-    if (seq.length >= 2) {
-      for (int i = 0; i < seq.length - 1; i++) {
-        totalDistance += _gcDistanceNm(
-          seq[i].latitude,
-          seq[i].longitude,
-          seq[i + 1].latitude,
-          seq[i + 1].longitude,
-        );
+    if (autoDistanceFromLatLon) {
+      // Build ordered sequence: Origin -> Hospital (if used) -> Waypoint1 (if used) -> Destination
+      double totalDistance = 0.0;
+      final seq = <LatLng>[];
+      if (originLat.isFinite && originLon.isFinite) {
+        seq.add(LatLng(originLat, originLon));
       }
-    }
+      if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
+        seq.add(LatLng(hLat, hLon));
+      }
+      if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
+        seq.add(LatLng(w1Lat, w1Lon));
+      }
+      if (destLat.isFinite && destLon.isFinite) {
+        seq.add(LatLng(destLat, destLon));
+      }
 
-    missionDistance = totalDistance;
-    missionDistanceController.text = totalDistance.toStringAsFixed(0);
+      if (seq.length >= 2) {
+        for (int i = 0; i < seq.length - 1; i++) {
+          totalDistance += _gcDistanceNm(
+            seq[i].latitude,
+            seq[i].longitude,
+            seq[i + 1].latitude,
+            seq[i + 1].longitude,
+          );
+        }
+        missionDistance = totalDistance;
+        missionDistanceController.text = totalDistance.toStringAsFixed(0);
+      }
+      // if seq < 2 we leave missionDistance as parsed from the input field
+    }
     // ...existing code...
     // Base performance (may change if AI auto-applies)
     var perf = calculateCruisePerformance(
@@ -2870,6 +3307,18 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           lon: originLon,
           trackDeg: trackDeg,
         );
+        // keep a copy for the dialog / map markers so "Show Winds Aloft" can display it
+        _departureWindsAloft = _aiWindsAloft;
+
+        // optionally also fetch and store destination winds so dialog shows both
+        if (destLat.isFinite && destLon.isFinite) {
+          await fetchAiAltitudeSuggestion(
+            lat: destLat,
+            lon: destLon,
+            trackDeg: trackDeg,
+          );
+          _destinationWindsAloft = _aiWindsAloft;
+        }
 
         if (_aiTailwindOutKts != null) tailwindOut = _aiTailwindOutKts!;
         if (_aiTailwindBackKts != null) tailwindBack = _aiTailwindBackKts!;
@@ -2903,6 +3352,23 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       }
     }
 
+    // After winds/AI logic (and after any AI auto-apply that may change
+    // cruiseSpeed/altitude), override Bell 412 burn from the table:
+    if (_selectedAircraft == 'Bell 412' && bh412Tables.isNotEmpty) {
+      final burnLbsHr =
+          _bh412GetBurn(altitude.toInt(), temperature.toInt(), cruiseSpeed) ??
+          0.0;
+      final burnKgHr = lbsToKg(burnLbsHr); // keep internals in kg/hr
+      perf['fuelBurnPerHour'] = burnKgHr;
+      if (kDebugMode) {
+        debugPrint(
+          'B412 burn override: '
+          '${burnLbsHr.toStringAsFixed(0)} lbs/hr '
+          '(${burnKgHr.toStringAsFixed(0)} kg/hr)',
+        );
+      }
+    }
+
     // Final calculations
     final d = missionDistance;
     final gsOut = (cruiseSpeed + tailwindOut).clamp(1.0, double.infinity);
@@ -2931,7 +3397,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     });
 
     if (!mounted) return;
-    // ignore: use_build_context_synchronously
     showCruiseResultsDialog(
       context: context,
       endurance: endurance,
@@ -2947,18 +3412,19 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       adjustedFuelBurn: adjustedFuelBurn,
       hoistMinutesRounded: hoistMinutesRounded,
       hoistFuel: hoistFuel,
+      fuelRequired: fuelForMission + hoistFuel,
       aiAltitudeFt: _aiSuggestedAltitudeFt,
       aiTailwindKts: _aiTailwindKts,
       aiTailwindOutKts: _aiTailwindOutKts,
       aiTailwindBackKts: _aiTailwindBackKts,
       aiSuggestedIas: _aiSuggestedIas,
+      isBell412: _selectedAircraft == 'Bell 412',
       originLat: originLat.isFinite ? originLat : null,
       originLon: originLon.isFinite ? originLon : null,
       destLat: destLat.isFinite ? destLat : null,
       destLon: destLon.isFinite ? destLon : null,
       roundTrip: roundTrip,
     );
-
     // Winds Aloft for PDF/export
     final windData =
         _aiWindsAloft ??
@@ -2971,7 +3437,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     // Build a simple Map<int,double> of tailwinds to pass to getOrInterpolateWind
     final tailwinds = <int, double>{};
     windData.forEach((k, v) {
-      tailwinds[k] = (v['tailwind'] ?? 0).toDouble();
+      tailwinds[k] = _numToDouble(v['tailwind']);
     });
 
     // Store data for PDF export

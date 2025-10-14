@@ -2578,6 +2578,18 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     return {'speed': speed, 'dirFrom': dirFromDeg};
   }
 
+  int _aw139MinPerfAlt() {
+    final keys = fuelBurnTables.keys.toList()..sort();
+    return keys.isEmpty ? 0 : keys.first;
+  }
+
+  int _aw139MaxPerfAlt() {
+    final keys = fuelBurnTables.keys.toList()..sort();
+    return keys.isEmpty
+        ? 6000
+        : keys.last; // auto‑extends when you add 8000/10000
+  }
+
   // Helper: lookup / interpolate Bell‑412 burn from loaded bh412Tables
   // Bilinear in (altitude, OAT) and linear in IAS. Tables are lbs/hr.
   double? _bh412GetBurn(int altitudeFt, int oatC, double iasKts) {
@@ -2988,6 +3000,38 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               .toList()
             ..sort();
 
+      // ---- PATCH: Clamp eval altitudes to performance table ranges ----
+      final aw139AltKeys = fuelBurnTables.keys.toList()..sort();
+      final aw139MinAlt = aw139AltKeys.isEmpty ? 0 : aw139AltKeys.first;
+      final aw139MaxAlt = aw139AltKeys.isEmpty ? 6000 : aw139AltKeys.last;
+      final b412AltKeys = bh412Tables.keys.toList()..sort();
+      final b412MinAlt = b412AltKeys.isEmpty ? aw139MinAlt : b412AltKeys.first;
+      final b412MaxAlt = b412AltKeys.isEmpty ? aw139MaxAlt : b412AltKeys.last;
+      final perfMinAlt = _selectedAircraft == 'Bell 412'
+          ? b412MinAlt
+          : aw139MinAlt;
+      final perfMaxAlt = _selectedAircraft == 'Bell 412'
+          ? b412MaxAlt
+          : aw139MaxAlt;
+
+      final filteredCandidateAltitudes =
+          candidateAltitudes
+              .where((a) => a >= perfMinAlt && a <= perfMaxAlt)
+              .toList()
+            ..sort();
+
+      final evalAltitudes = filteredCandidateAltitudes.isEmpty
+          ? candidateAltitudes
+          : filteredCandidateAltitudes;
+
+      if (kDebugMode) {
+        debugPrint(
+          'AI_ALT_CLAMP: type=$_selectedAircraft perfRange=$perfMinAlt-$perfMaxAlt '
+          'evalCount=${evalAltitudes.length}',
+        );
+      }
+      // ---- END PATCH ----
+
       // Evaluate candidates using existing logic (reuse _aiWindsAloft -> baseLevels)
       final baseLevels =
           _aiWindsAloft?.entries.map((e) {
@@ -3028,7 +3072,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         165,
       ];
 
-      for (final alt in candidateAltitudes) {
+      for (final alt in evalAltitudes) {
         final tails = _tailOutBack(alt, trackDeg, baseLevels);
         final outTail = tails['out']!;
         final backTail = tails['back']!;
@@ -3187,6 +3231,17 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     // ensure missionDistance reads from the input field unless auto-calculated later
     missionDistance = _parseNumber(missionDistanceController.text);
     altitude = _parseNumber(altitudeController.text);
+    if (_selectedAircraft == 'AW139') {
+      final minA = _aw139MinPerfAlt().toDouble();
+      final maxA = _aw139MaxPerfAlt().toDouble();
+      if (altitude > maxA) {
+        altitude = maxA;
+        altitudeController.text = altitude.toStringAsFixed(0);
+      } else if (altitude < minA) {
+        altitude = minA;
+        altitudeController.text = altitude.toStringAsFixed(0);
+      }
+    }
     temperature = _parseNumber(temperatureController.text);
     fuelOnboard = _parseNumber(fuelController.text);
     // if Bell 412 selected, user enters lbs -> convert to kg for internal calcs

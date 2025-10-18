@@ -16,6 +16,9 @@ const String kWindyApiKey = 'a4wqVgw3RBBPbjA0PjMtmD1I9PK0ndAX';
 
 enum WindProvider { openMeteo, windy }
 
+// AI optimization objective
+enum OptimizationObjective { minFuel, minTime, hybrid }
+
 // OpenWeatherMap API key (replace with your OpenWeatherMap key).
 // Do NOT commit this value to a public repo.
 const String kOpenWeatherApiKey = 'f7084ce97f81d6e4e49b7f393aa69da4';
@@ -337,6 +340,7 @@ void showCruiseResultsDialog({
   required double hoistMinutesRounded,
   required double hoistFuel,
   required double fuelRequired,
+  List<Map<String, double>>? fuelTimelineKg,
   double? aiAltitudeFt,
   double? aiTailwindKts,
   double? aiTailwindOutKts,
@@ -429,6 +433,32 @@ void showCruiseResultsDialog({
                 Text('Cruise Speed: ${cruiseSpeed.toStringAsFixed(0)} knots'),
                 Text('Altitude: ${altitude.toStringAsFixed(0)} ft'),
                 Text('Temperature: ${temperature.toStringAsFixed(0)} °C'),
+
+                if (fuelTimelineKg != null && fuelTimelineKg.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  const Divider(thickness: 1, color: Colors.grey),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Fuel Remaining every 20 min',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: fuelTimelineKg.map((p) {
+                      final mins = p['minute'] ?? 0.0;
+                      final remKg = p['remainingKg'] ?? 0.0;
+                      final remDisp = isBell412 ? kgToLbs(remKg) : remKg;
+                      return Chip(
+                        backgroundColor: kPanelColor,
+                        label: Text(
+                          'T+${mins.toStringAsFixed(0)}: ${remDisp.round()} $weightUnit',
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ],
 
                 // Coordinates (shown if provided)
                 if (originLat != null && originLon != null)
@@ -728,6 +758,56 @@ double getCorrectionFactor({
   return factor;
 }
 
+List<Map<String, double>> _buildFuelTimeline({
+  required double initialFuelKg,
+  required double cruiseBurnKgPerHr,
+  required double outHours,
+  required double backHours,
+  required double hoistHours,
+  int intervalMin = 20,
+}) {
+  const hoistBurnKgPerHr = 450.0;
+  final outMin = (outHours * 60.0).clamp(0.0, double.infinity);
+  final backMin = (backHours * 60.0).clamp(0.0, double.infinity);
+  final hoistMin = (hoistHours * 60.0).clamp(0.0, double.infinity);
+  final totalMin = outMin + backMin + hoistMin;
+
+  double consumedAt(double tMin) {
+    double t = tMin.clamp(0.0, totalMin);
+    double c = 0.0;
+    final m1 = math.min(t, outMin);
+    c += (m1 / 60.0) * cruiseBurnKgPerHr;
+    t -= m1;
+    if (t <= 0) return c;
+
+    final m2 = math.min(t, backMin);
+    c += (m2 / 60.0) * cruiseBurnKgPerHr;
+    t -= m2;
+    if (t <= 0) return c;
+
+    final m3 = math.min(t, hoistMin);
+    c += (m3 / 60.0) * hoistBurnKgPerHr;
+    return c;
+  }
+
+  final points = <Map<String, double>>[];
+  for (int m = 0; m <= totalMin; m += intervalMin) {
+    final rem = (initialFuelKg - consumedAt(m.toDouble())).clamp(
+      0.0,
+      initialFuelKg,
+    );
+    points.add({'minute': m.toDouble(), 'remainingKg': rem});
+  }
+  if (points.isEmpty || points.last['minute'] != totalMin) {
+    final rem = (initialFuelKg - consumedAt(totalMin)).clamp(
+      0.0,
+      initialFuelKg,
+    );
+    points.add({'minute': totalMin, 'remainingKg': rem});
+  }
+  return points;
+}
+
 Map<String, double> calculateCruisePerformance({
   required double distance,
   required double cruiseSpeed,
@@ -907,6 +987,10 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   double? _aiTailwindBackKts;
   double? _aiSuggestedIas;
 
+  // AI optimization settings
+  OptimizationObjective _objective = OptimizationObjective.minFuel;
+  double _timeWeightKgPerMin = 0.0; // hybrid: how many kg one minute is “worth”
+
   // Aircraft selection (default AW139). Add 'Bell 412' when you upload tables.
   String _selectedAircraft = 'AW139';
   static const List<String> kAircraftOptions = ['AW139', 'Bell 412'];
@@ -916,7 +1000,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       ? WindProvider.windy
       : WindProvider.openMeteo;
   static const Map<WindProvider, String> _windProviderNames = {
-    WindProvider.windy: 'Windy (requires key)',
+    WindProvider.windy: 'Windy',
     WindProvider.openMeteo: 'Open‑Meteo',
   };
 
@@ -1457,6 +1541,73 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                       ],
                     ),
                   ),
+                  // AI objective selector
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6.0),
+                    child: Row(
+                      children: [
+                        const Text(
+                          'AI Objective: ',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        const SizedBox(width: 8),
+                        DropdownButton<OptimizationObjective>(
+                          value: _objective,
+                          dropdownColor: kPanelColor,
+                          items: const [
+                            DropdownMenuItem(
+                              value: OptimizationObjective.minFuel,
+                              child: Text(
+                                'Min Fuel',
+                                style: TextStyle(color: Colors.white),
+                              ),
+                            ),
+                            DropdownMenuItem(
+                              value: OptimizationObjective.minTime,
+                              child: Text(
+                                'Min Time',
+                                style: TextStyle(color: Colors.white),
+                              ),
+                            ),
+                            DropdownMenuItem(
+                              value: OptimizationObjective.hybrid,
+                              child: Text(
+                                'Hybrid (Fuel + k·Time)',
+                                style: TextStyle(color: Colors.white),
+                              ),
+                            ),
+                          ],
+                          onChanged: (v) {
+                            if (v != null) setState(() => _objective = v);
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (_objective == OptimizationObjective.hybrid)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Time weight: ${_timeWeightKgPerMin.toStringAsFixed(2)} kg/min',
+                            style: const TextStyle(color: Colors.white70),
+                          ),
+                          Slider(
+                            value: _timeWeightKgPerMin,
+                            min: 0.0,
+                            max: 2.0, // 0–2 kg per minute (0–120 kg/h)
+                            divisions: 40,
+                            label:
+                                '${_timeWeightKgPerMin.toStringAsFixed(2)} kg/min',
+                            onChanged: (v) {
+                              setState(() => _timeWeightKgPerMin = v);
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
                   SwitchListTile(
                     title: const Text('Show Mission Map & Weather'),
                     value: showMap,
@@ -2389,13 +2540,46 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                       const Text(
                                         'Surface = 10m wind. Press Close when done.',
                                       ),
-                                      const SizedBox(height: 12),
                                       Align(
                                         alignment: Alignment.centerRight,
-                                        child: TextButton(
-                                          onPressed: () =>
-                                              Navigator.of(dialogContext).pop(),
-                                          child: const Text('Close'),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            TextButton.icon(
+                                              icon: const Icon(Icons.print),
+                                              label: const Text('Print'),
+                                              onPressed: () {
+                                                Map<int, double>? toTailwindMap(
+                                                  Map<int, Map<String, double>>?
+                                                  src,
+                                                ) {
+                                                  if (src == null) return null;
+                                                  return src.map(
+                                                    (alt, m) => MapEntry(
+                                                      alt,
+                                                      (m['tailwind'] ?? 0.0),
+                                                    ),
+                                                  );
+                                                }
+
+                                                CruiseReportExporter.previewWindsOnly(
+                                                  departure: toTailwindMap(
+                                                    _departureWindsAloft,
+                                                  ),
+                                                  destination: toTailwindMap(
+                                                    _destinationWindsAloft,
+                                                  ),
+                                                );
+                                              },
+                                            ),
+                                            const SizedBox(width: 8),
+                                            TextButton(
+                                              onPressed: () => Navigator.of(
+                                                dialogContext,
+                                              ).pop(),
+                                              child: const Text('Close'),
+                                            ),
+                                          ],
                                         ),
                                       ),
                                     ],
@@ -2689,6 +2873,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     required double tailwindOutKts,
     required double tailwindBackKts,
     required double distanceNmOneWay,
+    required OptimizationObjective objective,
+    required double timeWeightKgPerMin,
   }) {
     // Use Bell-412 speed set when the user has selected that aircraft and we have tables.
     final List<int> candidates =
@@ -2789,11 +2975,10 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       }
 
       if (raw == null) {
-        // Open‑Meteo fallback (request surface + the pressure levels we care about)
+        // Open‑Meteo fallback
         final omParams = StringBuffer()
           ..write('&forecast_days=1')
           ..write('&hourly=')
-          // surface winds (10m)
           ..write('windspeed_10m,winddirection_10m');
         for (final lvl in desiredLevels) {
           if (lvl == 'sfc') continue;
@@ -2811,7 +2996,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         if (kDebugMode) debugPrint('RAW_OPENMETEO: $raw');
       }
 
-      // normalize generically into level -> (speed m/s, dirFrom)
+      // normalize -> level alt(ft) -> {tailwind, dir, pressure, rawSpeedMps}
       final Map<int, Map<String, double>> profile = {};
 
       if (raw['provider'] == 'windy') {
@@ -2819,15 +3004,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         final levels = (wd['levels'] is Map)
             ? wd['levels'] as Map<String, dynamic>
             : <String, dynamic>{};
-        if (levels.isEmpty) {
-          if (kDebugMode) {
-            debugPrint('WINDY: no levels key found in response: ${wd.keys}');
-          }
-        }
 
-        // Use whatever level keys Windy returned (robust to 'sfc', numeric strings, or other names)
         final available = levels.keys.toList();
-        // Try to sort numerically when possible, keeping 'sfc' first
         available.sort((a, b) {
           if (a == 'sfc') return -1;
           if (b == 'sfc') return 1;
@@ -2837,56 +3015,46 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         });
 
         for (final lvl in available) {
-          try {
-            final entry = levels[lvl] as Map<String, dynamic>?;
-            if (entry == null) continue;
-
-            // Wind may be nested under 'wind' or present as top-level fields; try common names.
-            Map<String, dynamic>? windMap = entry['wind'] is Map
-                ? entry['wind'] as Map<String, dynamic>
-                : null;
-            double sp = 0.0;
-            double dir = 0.0;
-            if (windMap != null) {
-              sp = _numToDouble(
-                windMap['speed'] ?? windMap['wind_speed'] ?? windMap['ws'],
-              );
-              dir = _numToDouble(
-                windMap['direction'] ??
-                    windMap['dir'] ??
-                    windMap['wind_direction'],
-              );
-            } else {
-              // fallback to common top-level keys
-              sp = _numToDouble(
-                entry['speed'] ?? entry['wind_speed'] ?? entry['windSpeed'],
-              );
-              dir = _numToDouble(
-                entry['direction'] ?? entry['dir'] ?? entry['wind_direction'],
-              );
-            }
-            if (sp == 0 && dir == 0) continue;
-
-            final pressure = (lvl == 'sfc') ? 0 : int.tryParse(lvl) ?? 0;
-            final altFt = (pressure == 0)
-                ? 0
-                : pressureHpaToFeet(pressure.toDouble()).round();
-            profile[altFt] = {
-              'tailwind': _tailwindKts(sp, dir, trackDeg),
-              'dir': dir,
-              'pressure': pressure.toDouble(),
-              'rawSpeedMps': sp,
-            };
-          } catch (e) {
-            if (kDebugMode) debugPrint('WINDY parse error for level $lvl: $e');
-            continue;
+          final entry = levels[lvl] as Map<String, dynamic>?;
+          if (entry == null) continue;
+          Map<String, dynamic>? windMap = entry['wind'] is Map
+              ? entry['wind'] as Map<String, dynamic>
+              : null;
+          double sp = 0.0, dir = 0.0;
+          if (windMap != null) {
+            sp = _numToDouble(
+              windMap['speed'] ?? windMap['wind_speed'] ?? windMap['ws'],
+            );
+            dir = _numToDouble(
+              windMap['direction'] ??
+                  windMap['dir'] ??
+                  windMap['wind_direction'],
+            );
+          } else {
+            sp = _numToDouble(
+              entry['speed'] ?? entry['wind_speed'] ?? entry['windSpeed'],
+            );
+            dir = _numToDouble(
+              entry['direction'] ?? entry['dir'] ?? entry['wind_direction'],
+            );
           }
+          if (sp == 0 && dir == 0) continue;
+
+          final pressure = (lvl == 'sfc') ? 0 : int.tryParse(lvl) ?? 0;
+          final altFt = (pressure == 0)
+              ? 0
+              : pressureHpaToFeet(pressure.toDouble()).round();
+          profile[altFt] = {
+            'tailwind': _tailwindKts(sp, dir, trackDeg),
+            'dir': dir,
+            'pressure': pressure.toDouble(),
+            'rawSpeedMps': sp,
+          };
         }
       } else {
         final data = raw['data'] as Map<String, dynamic>;
         final h = (data['hourly'] ?? {}) as Map<String, dynamic>;
 
-        // surface first (handle either naming: windspeed_10m or wind_speed_10m)
         final sSp = _numToDouble(
           h['windspeed_10m'] != null
               ? (h['windspeed_10m']?[0])
@@ -2906,7 +3074,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           };
         }
 
-        // Discover which pressure-level keys the API actually returned (robust to missing levels)
         final presentLevels = <int>{};
         for (final k in h.keys) {
           final m = RegExp(r'wind_speed_(\d+)hPa').firstMatch(k);
@@ -2915,8 +3082,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
             if (p != null) presentLevels.add(p);
           }
         }
-
-        // Build ordered list of levels to use: prefer discovered presentLevels, else fallback to desiredLevels
         final levelsToUse = <String>[];
         if (presentLevels.isNotEmpty) {
           final sorted = presentLevels.toList()..sort();
@@ -2924,7 +3089,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
             levelsToUse.add(p.toString());
           }
         } else {
-          // no discovered levels — fall back to configured desiredLevels (this keeps prior behaviour)
           levelsToUse.addAll(desiredLevels.where((l) => l != 'sfc'));
         }
 
@@ -2936,8 +3100,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           final spRaw = (spArr is List && spArr.isNotEmpty)
               ? _numToDouble(spArr[0])
               : _numToDouble(spArr);
-          // Open-Meteo returns km/h, convert to m/s for all wind_speed_*hPa keys
-          final sp = spRaw / 3.6;
+          final sp = spRaw / 3.6; // km/h -> m/s
           final dr = (drArr is List && drArr.isNotEmpty)
               ? _numToDouble(drArr[0])
               : _numToDouble(drArr);
@@ -2955,14 +3118,11 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           };
         }
       }
-      // ...existing code...
 
       if (profile.isEmpty) return;
 
-      // store normalized profile
       _aiWindsAloft = profile;
 
-      // optional persist per-storeKey
       if (storeKey != null) {
         final baseLevels = profile.entries.map((e) {
           return {
@@ -2974,9 +3134,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         _fetchedWindLevelsByKey[storeKey] = baseLevels;
       }
 
-      // Use profile keys (altitudes in ft) as anchors for candidate generation
+      // anchors and candidate altitudes
       final anchors = profile.keys.map((k) => k.toDouble()).toList()..sort();
-
       final candSet = <int>{};
       for (final a in anchors) {
         final ai = a.toInt();
@@ -2991,7 +3150,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       for (int a = (minA ~/ 500) * 500; a <= maxA; a += 500) {
         candSet.add(a);
       }
-
       final candidateAltitudes =
           candSet
               .map((v) => v.clamp(500, 20000))
@@ -3000,7 +3158,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               .toList()
             ..sort();
 
-      // ---- PATCH: Clamp eval altitudes to performance table ranges ----
+      // Clamp by performance table range (AW139 vs 412)
       final aw139AltKeys = fuelBurnTables.keys.toList()..sort();
       final aw139MinAlt = aw139AltKeys.isEmpty ? 0 : aw139AltKeys.first;
       final aw139MaxAlt = aw139AltKeys.isEmpty ? 6000 : aw139AltKeys.last;
@@ -3030,9 +3188,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           'evalCount=${evalAltitudes.length}',
         );
       }
-      // ---- END PATCH ----
 
-      // Evaluate candidates using existing logic (reuse _aiWindsAloft -> baseLevels)
       final baseLevels =
           _aiWindsAloft?.entries.map((e) {
             return {
@@ -3043,18 +3199,18 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           }).toList() ??
           [];
 
-      // existing evaluation loop follows (keeps prior logic unchanged)
       double? bestSingleAlt;
-      double? bestSingleFuel;
+      double? bestSingleFuel; // stores "cost"
       double? bestSingleIas;
       double? bestSingleOut;
       double? bestSingleBack;
 
       double? bestOutAlt;
-      double? bestOutFuel;
+      double? bestOutFuel; // cost
       double? bestOutIas;
+
       double? bestBackAlt;
-      double? bestBackFuel;
+      double? bestBackFuel; // cost
       double? bestBackIas;
 
       const candidateIas = [
@@ -3077,17 +3233,28 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         final outTail = tails['out']!;
         final backTail = tails['back']!;
 
+        // Single-alt optimize IAS
         final opt = suggestBestIas(
           altFt: alt.toInt(),
           oatC: (temperature).toInt(),
           tailwindOutKts: outTail,
           tailwindBackKts: backTail,
           distanceNmOneWay: missionDistance,
+          objective: _objective,
+          timeWeightKgPerMin: _timeWeightKgPerMin,
         );
         if (opt != null) {
-          final fuel = opt['fuel']!;
-          if (bestSingleFuel == null || fuel < bestSingleFuel) {
-            bestSingleFuel = fuel;
+          final fuelKg = opt['fuel']!;
+          final timeHrs = opt['time']!;
+          final timeMin = timeHrs * 60.0;
+          final singleCost = switch (_objective) {
+            OptimizationObjective.minFuel => fuelKg,
+            OptimizationObjective.minTime => timeHrs,
+            OptimizationObjective.hybrid =>
+              fuelKg + _timeWeightKgPerMin * timeMin,
+          };
+          if (bestSingleFuel == null || singleCost < bestSingleFuel) {
+            bestSingleFuel = singleCost;
             bestSingleAlt = alt;
             bestSingleIas = opt['ias'];
             bestSingleOut = outTail;
@@ -3095,24 +3262,43 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           }
         }
 
-        double? bestFuelForThisOut;
+        // Out leg per IAS
+        double? bestFuelForThisOut; // "cost"
         double? bestIasForThisOut;
         for (final ias in candidateIas) {
-          final tq = getTorqueForIAS(
-            alt.toInt(),
-            temperature.toInt(),
-            ias.toDouble(),
-          );
-          final burnPerHr = interpolateFuelBurn(
-            tq,
-            alt.toInt(),
-            temperature.toInt(),
-          );
+          double burnPerHr;
+          if (_selectedAircraft == 'Bell 412' && bh412Tables.isNotEmpty) {
+            final bLbs =
+                _bh412GetBurn(
+                  alt.toInt(),
+                  temperature.toInt(),
+                  ias.toDouble(),
+                ) ??
+                0.0;
+            burnPerHr = lbsToKg(bLbs);
+          } else {
+            final tq = getTorqueForIAS(
+              alt.toInt(),
+              temperature.toInt(),
+              ias.toDouble(),
+            );
+            burnPerHr = interpolateFuelBurn(
+              tq,
+              alt.toInt(),
+              temperature.toInt(),
+            );
+          }
           final gsOut = (ias + outTail).clamp(30.0, 220.0);
           final timeOut = missionDistance / gsOut;
-          final fuelOut = burnPerHr * timeOut;
-          if (bestFuelForThisOut == null || fuelOut < bestFuelForThisOut) {
-            bestFuelForThisOut = fuelOut;
+          final fuelOut = burnPerHr * timeOut; // kg
+          final costOut = switch (_objective) {
+            OptimizationObjective.minFuel => fuelOut,
+            OptimizationObjective.minTime => timeOut,
+            OptimizationObjective.hybrid =>
+              fuelOut + _timeWeightKgPerMin * (timeOut * 60.0),
+          };
+          if (bestFuelForThisOut == null || costOut < bestFuelForThisOut) {
+            bestFuelForThisOut = costOut;
             bestIasForThisOut = ias.toDouble();
           }
         }
@@ -3124,24 +3310,43 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           }
         }
 
-        double? bestFuelForThisBack;
+        // Back leg per IAS
+        double? bestFuelForThisBack; // "cost"
         double? bestIasForThisBack;
         for (final ias in candidateIas) {
-          final tq = getTorqueForIAS(
-            alt.toInt(),
-            temperature.toInt(),
-            ias.toDouble(),
-          );
-          final burnPerHr = interpolateFuelBurn(
-            tq,
-            alt.toInt(),
-            temperature.toInt(),
-          );
+          double burnPerHr;
+          if (_selectedAircraft == 'Bell 412' && bh412Tables.isNotEmpty) {
+            final bLbs =
+                _bh412GetBurn(
+                  alt.toInt(),
+                  temperature.toInt(),
+                  ias.toDouble(),
+                ) ??
+                0.0;
+            burnPerHr = lbsToKg(bLbs);
+          } else {
+            final tq = getTorqueForIAS(
+              alt.toInt(),
+              temperature.toInt(),
+              ias.toDouble(),
+            );
+            burnPerHr = interpolateFuelBurn(
+              tq,
+              alt.toInt(),
+              temperature.toInt(),
+            );
+          }
           final gsBack = (ias + backTail).clamp(30.0, 220.0);
           final timeBack = missionDistance / gsBack;
-          final fuelBack = burnPerHr * timeBack;
-          if (bestFuelForThisBack == null || fuelBack < bestFuelForThisBack) {
-            bestFuelForThisBack = fuelBack;
+          final fuelBack = burnPerHr * timeBack; // kg
+          final costBack = switch (_objective) {
+            OptimizationObjective.minFuel => fuelBack,
+            OptimizationObjective.minTime => timeBack,
+            OptimizationObjective.hybrid =>
+              fuelBack + _timeWeightKgPerMin * (timeBack * 60.0),
+          };
+          if (bestFuelForThisBack == null || costBack < bestFuelForThisBack) {
+            bestFuelForThisBack = costBack;
             bestIasForThisBack = ias.toDouble();
           }
         }
@@ -3152,8 +3357,9 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
             bestBackIas = bestIasForThisBack;
           }
         }
-      }
+      } // end alt loop
 
+      // Compare single vs separate (costs)
       double? combinedSeparateFuel =
           (bestOutFuel != null && bestBackFuel != null)
           ? (bestOutFuel + bestBackFuel)
@@ -3165,19 +3371,22 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       double? chosenSingleOut = bestSingleOut;
       double? chosenSingleBack = bestSingleBack;
 
-      if (combinedSeparateFuel != null &&
+      final useSeparate =
+          combinedSeparateFuel != null &&
           bestSingleFuel != null &&
-          combinedSeparateFuel < bestSingleFuel) {
+          combinedSeparateFuel < bestSingleFuel;
+
+      if (useSeparate) {
         if (bestOutAlt != null) {
           chosenOutTail = _tailOutBack(bestOutAlt, trackDeg, baseLevels)['out'];
         }
-      }
-      if (bestBackAlt != null) {
-        chosenBackTail = _tailOutBack(
-          bestBackAlt,
-          trackDeg,
-          baseLevels,
-        )['back'];
+        if (bestBackAlt != null) {
+          chosenBackTail = _tailOutBack(
+            bestBackAlt,
+            trackDeg,
+            baseLevels,
+          )['back'];
+        }
       } else {
         chosenOutTail = chosenSingleOut;
         chosenBackTail = chosenSingleBack;
@@ -3199,10 +3408,11 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
 
       // ignore: avoid_print
       print(
-        'AI_CHOICE: singleAlt=$chosenSingleAlt singleFuel=$bestSingleFuel outAlt=$bestOutAlt outFuel=$bestOutFuel backAlt=$bestBackAlt backFuel=$bestBackFuel combinedSeparateFuel=$combinedSeparateFuel',
+        'AI_CHOICE: obj=$_objective singleAlt=$chosenSingleAlt singleCost=$bestSingleFuel '
+        'outAlt=$bestOutAlt outCost=$bestOutFuel backAlt=$bestBackAlt backCost=$bestBackFuel '
+        'combinedSeparateCost=$combinedSeparateFuel k=${_timeWeightKgPerMin.toStringAsFixed(2)} kg/min',
       );
     } catch (e) {
-      // ignore network / parse errors silently
       // ignore: avoid_print
       print('fetchAiAltitudeSuggestion error: $e');
     }
@@ -3445,6 +3655,18 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     final postMissionLowFuel = fuelRemainingAfterMission < 180;
     final missionDuration = cruiseDuration + hoistHours;
 
+    // Build timeline (kg)
+    final outHours = d / gsOut;
+    final backHours = roundTrip ? (d / gsBack) : 0.0;
+    final fuelTimelineKg = _buildFuelTimeline(
+      initialFuelKg: fuelOnboard,
+      cruiseBurnKgPerHr: adjustedFuelBurn,
+      outHours: outHours,
+      backHours: backHours,
+      hoistHours: hoistHours,
+      intervalMin: 20,
+    );
+
     setState(() {
       _lastRequiredTorque = perf['recommendedTorque']!;
       _lastAdjustedFuelBurn = adjustedFuelBurn;
@@ -3468,6 +3690,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       hoistMinutesRounded: hoistMinutesRounded,
       hoistFuel: hoistFuel,
       fuelRequired: fuelForMission + hoistFuel,
+      fuelTimelineKg: fuelTimelineKg,
       aiAltitudeFt: _aiSuggestedAltitudeFt,
       aiTailwindKts: _aiTailwindKts,
       aiTailwindOutKts: _aiTailwindOutKts,
@@ -3527,6 +3750,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         4000: getOrInterpolateWind(4000, tailwinds),
         6000: getOrInterpolateWind(6000, tailwinds),
       },
+      fuelRemainingTimelineKg: fuelTimelineKg,
+      isBell412: _selectedAircraft == 'Bell 412', // <-- add this
     );
   } // end calculateCruise
 } // end CruiseInputScreenState

@@ -3,8 +3,9 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:aw139_cruise/export/cruise_report_export.dart'; // <-- add this line
-import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
+import 'package:flutter/services.dart'
+    show rootBundle, Clipboard, ClipboardData;
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
@@ -900,6 +901,40 @@ Widget buildEquipmentToggles(
   );
 }
 
+class NavFix {
+  final String id;
+  final String name;
+  final double lat;
+  final double lon;
+  const NavFix({
+    required this.id,
+    required this.name,
+    required this.lat,
+    required this.lon,
+  });
+}
+
+const List<NavFix> kNavFixes = [
+  // TODO: Replace with your real reference points
+  NavFix(id: 'LCA', name: 'Larnaca VOR/DME (LCA)', lat: 34.8723, lon: 33.6243),
+  NavFix(id: 'PHA', name: 'Paphos VOR/DME (PHA)', lat: 34.7117, lon: 32.5058),
+];
+
+class WaypointItem {
+  final String id; // 'hospital' | 'wpt1' | 'wpt2'
+  final String title;
+  final TextEditingController lat;
+  final TextEditingController lon;
+  bool enabled;
+  WaypointItem({
+    required this.id,
+    required this.title,
+    required this.lat,
+    required this.lon,
+    this.enabled = false,
+  });
+}
+
 // Single, clean widget + state (remove any other duplicate class blocks above)
 class CruiseInputScreen extends StatefulWidget {
   const CruiseInputScreen({super.key});
@@ -954,6 +989,22 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       hospitalLonError;
   String? waypoint2LatError, waypoint2LonError;
 
+  void _syncWaypointFlagsFromList() {
+    for (final wp in _waypoints) {
+      switch (wp.id) {
+        case 'hospital':
+          useHospitalWaypoint = wp.enabled;
+          break;
+        case 'wpt1':
+          useWaypoint1 = wp.enabled;
+          break;
+        case 'wpt2':
+          useWaypoint2 = wp.enabled;
+          break;
+      }
+    }
+  }
+
   // Equipment toggles
   bool selectAllOptional = false;
   bool searchlight = false;
@@ -986,6 +1037,127 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   double? _aiTailwindOutKts;
   double? _aiTailwindBackKts;
   double? _aiSuggestedIas;
+
+  // Nav tool controllers/state
+  final _navRadialController = TextEditingController(text: '090');
+  final _navDistanceController = TextEditingController(text: '10'); // NM
+  int _selectedFixIndex = 0; // must be mutable for Dropdown
+  // ignore: unused_field
+  String? _navResultDecimal;
+  // ignore: unused_field
+  String? _navResultDms;
+  bool showNavTool = false;
+  final _navOutLatController = TextEditingController();
+  final _navOutLonController = TextEditingController();
+  // "Custom lat/lon…" option for the Nav tool dropdown
+  static const int _customBaseIndex = -1;
+  // Controllers for custom base coordinates (shown when _customBaseIndex selected)
+  final _navBaseLatController = TextEditingController();
+  final _navBaseLonController = TextEditingController();
+
+  LatLng _destinationPointFromRadialNm({
+    required double latDeg,
+    required double lonDeg,
+    required double radialDeg, // from the fix
+    required double distanceNm,
+  }) {
+    const double rNm = 3440.065;
+    final double bearing = radialDeg % 360.0;
+    final double phi1 = _degToRad(latDeg);
+    final double lambda1 = _degToRad(lonDeg);
+    final double theta = _degToRad(bearing);
+    final double delta = distanceNm / rNm;
+
+    final double sinPhi2 =
+        math.sin(phi1) * math.cos(delta) +
+        math.cos(phi1) * math.sin(delta) * math.cos(theta);
+    final double phi2 = math.asin(sinPhi2);
+
+    final double y = math.sin(theta) * math.sin(delta) * math.cos(phi1);
+    final double x = math.cos(delta) - math.sin(phi1) * math.sin(phi2);
+    final double lambda2 = lambda1 + math.atan2(y, x);
+
+    final double lat2 = _radToDeg(phi2);
+    final double lon2 = ((_radToDeg(lambda2) + 540) % 360) - 180;
+    return LatLng(lat2, lon2);
+  }
+
+  // Base-point resolver for Nav tool (uses dropdown, including Custom option)
+  LatLng? _navBasePoint() {
+    if (_selectedFixIndex == _customBaseIndex) {
+      final bLat = _parseCoord(_navBaseLatController.text, isLat: true);
+      final bLon = _parseCoord(_navBaseLonController.text, isLat: false);
+      if (bLat.isFinite && bLon.isFinite) return LatLng(bLat, bLon);
+      return null;
+    }
+    if (kNavFixes.isEmpty) return null;
+    final i = _selectedFixIndex.clamp(0, kNavFixes.length - 1);
+    final f = kNavFixes[i];
+    return LatLng(f.lat, f.lon);
+  }
+
+  // ignore: unused_element
+  void _computeNavFixPoint() {
+    final base = _navBasePoint();
+    final radial = _parseNumber(_navRadialController.text);
+    final distNm = _parseNumber(_navDistanceController.text);
+    if (base == null || !radial.isFinite || !distNm.isFinite) return;
+
+    final p = _destinationPointFromRadialNm(
+      latDeg: base.latitude,
+      lonDeg: base.longitude,
+      radialDeg: radial,
+      distanceNm: distNm,
+    );
+    _navOutLatController.text = _formatDms(p.latitude, isLat: true);
+    _navOutLonController.text = _formatDms(p.longitude, isLat: false);
+    setState(() {});
+  }
+
+  void _applyNavResultTo(String id) {
+    final base = _navBasePoint();
+    final radial = _parseNumber(_navRadialController.text);
+    final distNm = _parseNumber(_navDistanceController.text);
+    if (base == null || !radial.isFinite || !distNm.isFinite) return;
+
+    final p = _destinationPointFromRadialNm(
+      latDeg: base.latitude,
+      lonDeg: base.longitude,
+      radialDeg: radial,
+      distanceNm: distNm,
+    );
+    final latDms = _formatDms(p.latitude, isLat: true);
+    final lonDms = _formatDms(p.longitude, isLat: false);
+
+    setState(() {
+      switch (id) {
+        case 'hospital':
+          hospitalLatController.text = latDms;
+          hospitalLonController.text = lonDms;
+          useHospitalWaypoint = true;
+          break;
+        case 'wpt1':
+          waypoint1LatController.text = latDms;
+          waypoint1LonController.text = lonDms;
+          useWaypoint1 = true;
+          break;
+        case 'wpt2':
+          waypoint2LatController.text = latDms;
+          waypoint2LonController.text = lonDms;
+          useWaypoint2 = true;
+          break;
+      }
+      for (final wp in _waypoints) {
+        if (wp.id == id) {
+          wp.enabled = true;
+          wp.lat.text = latDms;
+          wp.lon.text = lonDms;
+        }
+      }
+    });
+    _validateAndDistance();
+  }
+  // ...existing code...
 
   // AI optimization settings
   OptimizationObjective _objective = OptimizationObjective.minFuel;
@@ -1021,6 +1193,9 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
 
   // Store wind profile arrays fetched per key (e.g. 'origin','dest')
   final Map<String, List<Map<String, double>>> _fetchedWindLevelsByKey = {};
+
+  // Draggable mid-route waypoints (Hospital / WP1 / WP2)
+  late List<WaypointItem> _waypoints;
 
   // Build arrow markers for a stored wind profile at a point (alt in ft)
   List<Marker> _buildWindArrowMarkers(
@@ -1167,22 +1342,45 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   }
   // _interpolateWind implementation moved to class scope above
 
-  // ...existing code...
   @override
   void initState() {
     super.initState();
     // load BH412 performance table (safe to call even if asset missing)
     loadBh412TablesFromAsset();
 
-    // existing controller initialisation
+    // controller initialization
     cruiseSpeedController.text = cruiseSpeed.toStringAsFixed(0);
     missionDistanceController.text = missionDistance.toStringAsFixed(0);
     altitudeController.text = altitude.toStringAsFixed(0);
     temperatureController.text = temperature.toStringAsFixed(0);
     fuelController.text = fuelOnboard.toStringAsFixed(0);
     hoistTimeController.text = extraHoistMinutes.toStringAsFixed(0);
+
+    // Initialize draggable waypoint list
+    _waypoints = [
+      WaypointItem(
+        id: 'hospital',
+        title: 'Hospital',
+        lat: hospitalLatController,
+        lon: hospitalLonController,
+        enabled: useHospitalWaypoint,
+      ),
+      WaypointItem(
+        id: 'wpt1',
+        title: 'Waypoint 1',
+        lat: waypoint1LatController,
+        lon: waypoint1LonController,
+        enabled: useWaypoint1,
+      ),
+      WaypointItem(
+        id: 'wpt2',
+        title: 'Waypoint 2',
+        lat: waypoint2LatController,
+        lon: waypoint2LonController,
+        enabled: useWaypoint2,
+      ),
+    ];
   }
-  // ...existing code...
 
   @override
   void dispose() {
@@ -1202,6 +1400,14 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     hospitalLonController.dispose();
     waypoint2LatController.dispose();
     waypoint2LonController.dispose();
+
+    // Nav tool controllers
+    _navRadialController.dispose();
+    _navDistanceController.dispose();
+    _navOutLatController.dispose();
+    _navOutLonController.dispose();
+    _navBaseLatController.dispose();
+    _navBaseLonController.dispose();
     super.dispose();
   }
 
@@ -1284,11 +1490,14 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       if (oLat.isFinite && oLon.isFinite) {
         points.add(LatLng(oLat, oLon));
       }
-      if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
-        points.add(LatLng(hLat, hLon));
-      }
-      if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
-        points.add(LatLng(w1Lat, w1Lon));
+      // Use draggable mid-route waypoints in current order
+      for (final wp in _waypoints) {
+        if (!wp.enabled) continue;
+        final wLat = _parseCoord(wp.lat.text, isLat: true);
+        final wLon = _parseCoord(wp.lon.text, isLat: false);
+        if (wLat.isFinite && wLon.isFinite) {
+          points.add(LatLng(wLat, wLon));
+        }
       }
       if (dLat.isFinite && dLon.isFinite) {
         points.add(LatLng(dLat, dLon));
@@ -1321,22 +1530,102 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         hospitalLonError = newHospitalLonError;
       });
     }
-    // ...existing code...
-    if (changed) {
-      setState(() {
-        originLatError = newOriginLatError;
-        originLonError = newOriginLonError;
-        waypoint1LatError = newWaypoint1LatError;
-        waypoint1LonError = newWaypoint1LonError;
-        destLatError = newDestLatError;
-        destLonError = newDestLonError;
-        hospitalLatError = newHospitalLatError;
-        hospitalLonError = newHospitalLonError;
-      });
-    }
     // end _validateAndDistance
   }
 
+  // ...existing code...
+  Widget buildWaypointPlanner() {
+    return Card(
+      color: kPanelColor,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Flight Plan Waypoints (drag to reorder)',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ReorderableListView(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              onReorder: (oldIndex, newIndex) {
+                setState(() {
+                  if (newIndex > oldIndex) newIndex -= 1;
+                  final item = _waypoints.removeAt(oldIndex);
+                  _waypoints.insert(newIndex, item);
+                  _validateAndDistance();
+                });
+              },
+              children: [
+                for (final wp in _waypoints)
+                  ListTile(
+                    key: ValueKey(wp.id),
+                    leading: const Icon(
+                      Icons.drag_indicator,
+                      color: Colors.white70,
+                    ),
+                    title: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            wp.title,
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                        Switch(
+                          value: wp.enabled,
+                          onChanged: (v) {
+                            setState(() {
+                              wp.enabled = v;
+                              _syncWaypointFlagsFromList(); // keep legacy flags in sync
+                            });
+                            _validateAndDistance();
+                          },
+                        ),
+                      ],
+                    ),
+                    subtitle: wp.enabled
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              coordField(
+                                '${wp.title} Latitude',
+                                wp.lat,
+                                isLat: true,
+                                errorText: null,
+                              ),
+                              coordField(
+                                '${wp.title} Longitude',
+                                wp.lon,
+                                isLat: false,
+                                errorText: null,
+                              ),
+                            ],
+                          )
+                        : null,
+                  ),
+              ],
+            ),
+            // ...existing code...
+
+            // ...existing code...
+            const SizedBox(height: 6),
+            const Text(
+              'Origin is first and Destination last. Only enabled items are included.',
+              style: TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ...existing code...
   Widget coordField(
     String label,
     TextEditingController controller, {
@@ -1544,42 +1833,67 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                   // AI objective selector
                   Padding(
                     padding: const EdgeInsets.symmetric(vertical: 6.0),
-                    child: Row(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         const Text(
-                          'AI Objective: ',
+                          'AI Objective',
                           style: TextStyle(color: Colors.white),
                         ),
-                        const SizedBox(width: 8),
-                        DropdownButton<OptimizationObjective>(
-                          value: _objective,
-                          dropdownColor: kPanelColor,
-                          items: const [
-                            DropdownMenuItem(
-                              value: OptimizationObjective.minFuel,
-                              child: Text(
-                                'Min Fuel',
-                                style: TextStyle(color: Colors.white),
-                              ),
+                        const SizedBox(height: 6),
+                        ToggleButtons(
+                          isSelected: [
+                            _objective == OptimizationObjective.minFuel,
+                            _objective == OptimizationObjective.minTime,
+                            _objective == OptimizationObjective.hybrid,
+                          ],
+                          onPressed: (i) {
+                            setState(() {
+                              switch (i) {
+                                case 0:
+                                  _objective = OptimizationObjective.minFuel;
+                                  break;
+                                case 1:
+                                  _objective = OptimizationObjective.minTime;
+                                  break;
+                                case 2:
+                                  _objective = OptimizationObjective.hybrid;
+                                  break;
+                              }
+                            });
+                            // Optional: auto-recalculate when objective changes
+                            if (useWindsAloft &&
+                                !standardWinds &&
+                                !_calculating) {
+                              setState(() => _calculating = true);
+                              unawaited(
+                                calculateCruise().whenComplete(() {
+                                  if (!mounted) return;
+                                  setState(() => _calculating = false);
+                                }),
+                              );
+                            }
+                          },
+                          borderRadius: const BorderRadius.all(
+                            Radius.circular(6),
+                          ),
+                          selectedColor: Colors.black,
+                          fillColor: Colors.cyanAccent,
+                          color: Colors.white70,
+                          children: const [
+                            Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 12),
+                              child: Text('Min Fuel'),
                             ),
-                            DropdownMenuItem(
-                              value: OptimizationObjective.minTime,
-                              child: Text(
-                                'Min Time',
-                                style: TextStyle(color: Colors.white),
-                              ),
+                            Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 12),
+                              child: Text('Min Time'),
                             ),
-                            DropdownMenuItem(
-                              value: OptimizationObjective.hybrid,
-                              child: Text(
-                                'Hybrid (Fuel + k·Time)',
-                                style: TextStyle(color: Colors.white),
-                              ),
+                            Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 12),
+                              child: Text('Hybrid'),
                             ),
                           ],
-                          onChanged: (v) {
-                            if (v != null) setState(() => _objective = v);
-                          },
                         ),
                       ],
                     ),
@@ -1608,6 +1922,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         ],
                       ),
                     ),
+                  // ...after the AI objective selector (and optional slider)...
                   SwitchListTile(
                     title: const Text('Show Mission Map & Weather'),
                     value: showMap,
@@ -1615,20 +1930,19 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
-                  // ...existing code...
                   if (showMap)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 8.0),
                       child: ElevatedButton.icon(
                         icon: const Icon(Icons.map),
-                        label: const Text('View Map'),
+                        label: const Text('View Mission Map'),
                         onPressed: () {
                           showDialog(
                             context: context,
                             builder: (_) => Dialog(
                               child: SizedBox(
-                                width: 900, // increased width
-                                height: 640, // increased height
+                                width: 900,
+                                height: 640,
                                 child: FlutterMap(
                                   options: MapOptions(
                                     initialCenter: LatLng(
@@ -1649,19 +1963,11 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                           'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
                                       subdomains: const ['a', 'b', 'c'],
                                     ),
-                                    // Uses kOpenWeatherApiKey constant defined at top of file
                                     Opacity(
                                       opacity: 0.7,
                                       child: TileLayer(
                                         urlTemplate:
                                             'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
-                                      ),
-                                    ),
-                                    Opacity(
-                                      opacity: 0.9,
-                                      child: TileLayer(
-                                        urlTemplate:
-                                            'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
                                       ),
                                     ),
                                     Opacity(
@@ -1671,391 +1977,180 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                             'https://tile.openweathermap.org/map/wind_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
                                       ),
                                     ),
+                                    // Route polyline (origin -> enabled waypoints -> destination)
                                     PolylineLayer(
                                       polylines: [
                                         Polyline(
-                                          points: [
-                                            // Origin
-                                            if (_parseCoord(
-                                                  originLatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  originLonController.text,
-                                                  isLat: false,
-                                                ).isFinite)
-                                              LatLng(
-                                                _parseCoord(
-                                                  originLatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  originLonController.text,
-                                                  isLat: false,
-                                                ),
-                                              ),
-                                            // Hospital (optional)
-                                            if (useHospitalWaypoint &&
-                                                hospitalLatController
-                                                    .text
-                                                    .isNotEmpty &&
-                                                hospitalLonController
-                                                    .text
-                                                    .isNotEmpty &&
-                                                _parseCoord(
-                                                  hospitalLatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  hospitalLonController.text,
-                                                  isLat: false,
-                                                ).isFinite)
-                                              LatLng(
-                                                _parseCoord(
-                                                  hospitalLatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  hospitalLonController.text,
-                                                  isLat: false,
-                                                ),
-                                              ),
-                                            // Waypoint 1 (optional)
-                                            if (useWaypoint1 &&
-                                                waypoint1LatController
-                                                    .text
-                                                    .isNotEmpty &&
-                                                waypoint1LonController
-                                                    .text
-                                                    .isNotEmpty &&
-                                                _parseCoord(
-                                                  waypoint1LatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  waypoint1LonController.text,
-                                                  isLat: false,
-                                                ).isFinite)
-                                              LatLng(
-                                                _parseCoord(
-                                                  waypoint1LatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  waypoint1LonController.text,
-                                                  isLat: false,
-                                                ),
-                                              ),
-                                            // Waypoint 2 (optional)
-                                            if (useWaypoint2 &&
-                                                waypoint2LatController
-                                                    .text
-                                                    .isNotEmpty &&
-                                                waypoint2LonController
-                                                    .text
-                                                    .isNotEmpty &&
-                                                _parseCoord(
-                                                  waypoint2LatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  waypoint2LonController.text,
-                                                  isLat: false,
-                                                ).isFinite)
-                                              LatLng(
-                                                _parseCoord(
-                                                  waypoint2LatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  waypoint2LonController.text,
-                                                  isLat: false,
-                                                ),
-                                              ),
-                                            // Destination
-                                            if (_parseCoord(
-                                                  destLatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  destLonController.text,
-                                                  isLat: false,
-                                                ).isFinite)
-                                              LatLng(
-                                                _parseCoord(
-                                                  destLatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  destLonController.text,
-                                                  isLat: false,
-                                                ),
-                                              ),
-                                          ],
+                                          points: () {
+                                            final pts = <LatLng>[];
+                                            final oLat = _parseCoord(
+                                              originLatController.text,
+                                              isLat: true,
+                                            );
+                                            final oLon = _parseCoord(
+                                              originLonController.text,
+                                              isLat: false,
+                                            );
+                                            final dLat = _parseCoord(
+                                              destLatController.text,
+                                              isLat: true,
+                                            );
+                                            final dLon = _parseCoord(
+                                              destLonController.text,
+                                              isLat: false,
+                                            );
+                                            if (oLat.isFinite &&
+                                                oLon.isFinite) {
+                                              pts.add(LatLng(oLat, oLon));
+                                            }
+                                            for (final wp in _waypoints) {
+                                              if (!wp.enabled) continue;
+                                              final wLat = _parseCoord(
+                                                wp.lat.text,
+                                                isLat: true,
+                                              );
+                                              final wLon = _parseCoord(
+                                                wp.lon.text,
+                                                isLat: false,
+                                              );
+                                              if (wLat.isFinite &&
+                                                  wLon.isFinite) {
+                                                pts.add(LatLng(wLat, wLon));
+                                              }
+                                            }
+                                            if (dLat.isFinite &&
+                                                dLon.isFinite) {
+                                              pts.add(LatLng(dLat, dLon));
+                                            }
+                                            return pts;
+                                          }(),
                                           color: Colors.blue,
                                           strokeWidth: 4,
                                         ),
                                       ],
                                     ),
-
-                                    // Markers for each point (same order)
+                                    // Route markers
                                     MarkerLayer(
-                                      markers: [
-                                        if (_parseCoord(
-                                              originLatController.text,
-                                              isLat: true,
-                                            ).isFinite &&
-                                            _parseCoord(
-                                              originLonController.text,
-                                              isLat: false,
-                                            ).isFinite)
-                                          Marker(
-                                            point: LatLng(
-                                              _parseCoord(
-                                                originLatController.text,
-                                                isLat: true,
-                                              ),
-                                              _parseCoord(
-                                                originLonController.text,
-                                                isLat: false,
-                                              ),
-                                            ),
-                                            width: 30,
-                                            height: 30,
-                                            child: const Icon(
-                                              Icons.location_on,
-                                              color: Colors.green,
-                                            ),
-                                          ),
-                                        if (useHospitalWaypoint &&
-                                            hospitalLatController
-                                                .text
-                                                .isNotEmpty &&
-                                            hospitalLonController
-                                                .text
-                                                .isNotEmpty &&
-                                            _parseCoord(
-                                              hospitalLatController.text,
-                                              isLat: true,
-                                            ).isFinite &&
-                                            _parseCoord(
-                                              hospitalLonController.text,
-                                              isLat: false,
-                                            ).isFinite)
-                                          Marker(
-                                            point: LatLng(
-                                              _parseCoord(
-                                                hospitalLatController.text,
-                                                isLat: true,
-                                              ),
-                                              _parseCoord(
-                                                hospitalLonController.text,
-                                                isLat: false,
+                                      markers: () {
+                                        final ms = <Marker>[];
+                                        final oLat = _parseCoord(
+                                          originLatController.text,
+                                          isLat: true,
+                                        );
+                                        final oLon = _parseCoord(
+                                          originLonController.text,
+                                          isLat: false,
+                                        );
+                                        final dLat = _parseCoord(
+                                          destLatController.text,
+                                          isLat: true,
+                                        );
+                                        final dLon = _parseCoord(
+                                          destLonController.text,
+                                          isLat: false,
+                                        );
+                                        if (oLat.isFinite && oLon.isFinite) {
+                                          ms.add(
+                                            Marker(
+                                              point: LatLng(oLat, oLon),
+                                              width: 30,
+                                              height: 30,
+                                              child: const Icon(
+                                                Icons.location_on,
+                                                color: Colors.green,
                                               ),
                                             ),
-                                            width: 30,
-                                            height: 30,
-                                            child: const Icon(
-                                              Icons.local_hospital,
-                                              color: Colors.pink,
+                                          );
+                                        }
+                                        for (final wp in _waypoints) {
+                                          if (!wp.enabled) continue;
+                                          final wLat = _parseCoord(
+                                            wp.lat.text,
+                                            isLat: true,
+                                          );
+                                          final wLon = _parseCoord(
+                                            wp.lon.text,
+                                            isLat: false,
+                                          );
+                                          if (!wLat.isFinite ||
+                                              !wLon.isFinite) {
+                                            continue;
+                                          }
+                                          ms.add(
+                                            Marker(
+                                              point: LatLng(wLat, wLon),
+                                              width: 28,
+                                              height: 28,
+                                              child: wp.id == 'hospital'
+                                                  ? const Icon(
+                                                      Icons.local_hospital,
+                                                      color: Colors.pink,
+                                                    )
+                                                  : const Icon(
+                                                      Icons.location_searching,
+                                                      color: Colors.cyan,
+                                                    ),
                                             ),
-                                          ),
-                                        if (useWaypoint1 &&
-                                            waypoint1LatController
-                                                .text
-                                                .isNotEmpty &&
-                                            waypoint1LonController
-                                                .text
-                                                .isNotEmpty &&
-                                            _parseCoord(
-                                              waypoint1LatController.text,
-                                              isLat: true,
-                                            ).isFinite &&
-                                            _parseCoord(
-                                              waypoint1LonController.text,
-                                              isLat: false,
-                                            ).isFinite)
-                                          Marker(
-                                            point: LatLng(
-                                              _parseCoord(
-                                                waypoint1LatController.text,
-                                                isLat: true,
-                                              ),
-                                              _parseCoord(
-                                                waypoint1LonController.text,
-                                                isLat: false,
-                                              ),
-                                            ),
-                                            width: 28,
-                                            height: 28,
-                                            child: const Icon(
-                                              Icons.location_searching,
-                                              color: Colors.cyan,
-                                            ),
-                                          ),
-                                        if (useWaypoint2 &&
-                                            waypoint2LatController
-                                                .text
-                                                .isNotEmpty &&
-                                            waypoint2LonController
-                                                .text
-                                                .isNotEmpty &&
-                                            _parseCoord(
-                                              waypoint2LatController.text,
-                                              isLat: true,
-                                            ).isFinite &&
-                                            _parseCoord(
-                                              waypoint2LonController.text,
-                                              isLat: false,
-                                            ).isFinite)
-                                          Marker(
-                                            point: LatLng(
-                                              _parseCoord(
-                                                waypoint2LatController.text,
-                                                isLat: true,
-                                              ),
-                                              _parseCoord(
-                                                waypoint2LonController.text,
-                                                isLat: false,
+                                          );
+                                        }
+                                        if (dLat.isFinite && dLon.isFinite) {
+                                          ms.add(
+                                            Marker(
+                                              point: LatLng(dLat, dLon),
+                                              width: 30,
+                                              height: 30,
+                                              child: const Icon(
+                                                Icons.flag,
+                                                color: Colors.red,
                                               ),
                                             ),
-                                            width: 28,
-                                            height: 28,
-                                            child: const Icon(
-                                              Icons.location_searching,
-                                              color: Colors.cyanAccent,
+                                          );
+                                        }
+                                        return ms;
+                                      }(),
+                                    ),
+                                    // Wind arrows overlay (origin/dest)
+                                    MarkerLayer(
+                                      markers: () {
+                                        final ms = <Marker>[];
+                                        final oLat = _parseCoord(
+                                          originLatController.text,
+                                          isLat: true,
+                                        );
+                                        final oLon = _parseCoord(
+                                          originLonController.text,
+                                          isLat: false,
+                                        );
+                                        final dLat = _parseCoord(
+                                          destLatController.text,
+                                          isLat: true,
+                                        );
+                                        final dLon = _parseCoord(
+                                          destLonController.text,
+                                          isLat: false,
+                                        );
+                                        if (oLat.isFinite && oLon.isFinite) {
+                                          ms.addAll(
+                                            _buildWindArrowMarkers(
+                                              'origin',
+                                              oLat,
+                                              oLon,
+                                              alt: altitude,
                                             ),
-                                          ),
-                                        if (_parseCoord(
-                                              destLatController.text,
-                                              isLat: true,
-                                            ).isFinite &&
-                                            _parseCoord(
-                                              destLonController.text,
-                                              isLat: false,
-                                            ).isFinite)
-                                          Marker(
-                                            point: LatLng(
-                                              _parseCoord(
-                                                destLatController.text,
-                                                isLat: true,
-                                              ),
-                                              _parseCoord(
-                                                destLonController.text,
-                                                isLat: false,
-                                              ),
+                                          );
+                                        }
+                                        if (dLat.isFinite && dLon.isFinite) {
+                                          ms.addAll(
+                                            _buildWindArrowMarkers(
+                                              'dest',
+                                              dLat,
+                                              dLon,
+                                              alt: altitude,
                                             ),
-                                            width: 30,
-                                            height: 30,
-                                            child: const Icon(
-                                              Icons.flag,
-                                              color: Colors.red,
-                                            ),
-                                          ),
-                                        // Wind arrows (spread markers built from stored profiles)
-                                        ...(_parseCoord(
-                                                  hospitalLatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  hospitalLonController.text,
-                                                  isLat: false,
-                                                ).isFinite
-                                            ? _buildWindArrowMarkers(
-                                                'hospital',
-                                                _parseCoord(
-                                                  hospitalLatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  hospitalLonController.text,
-                                                  isLat: false,
-                                                ),
-                                              )
-                                            : []),
-                                        // waypoint1
-                                        ...(_parseCoord(
-                                                  waypoint1LatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  waypoint1LonController.text,
-                                                  isLat: false,
-                                                ).isFinite
-                                            ? _buildWindArrowMarkers(
-                                                'wpt1',
-                                                _parseCoord(
-                                                  waypoint1LatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  waypoint1LonController.text,
-                                                  isLat: false,
-                                                ),
-                                              )
-                                            : []),
-                                        // waypoint2
-                                        ...(_parseCoord(
-                                                  waypoint2LatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  waypoint2LonController.text,
-                                                  isLat: false,
-                                                ).isFinite
-                                            ? _buildWindArrowMarkers(
-                                                'wpt2',
-                                                _parseCoord(
-                                                  waypoint2LatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  waypoint2LonController.text,
-                                                  isLat: false,
-                                                ),
-                                              )
-                                            : []),
-                                        ...(_parseCoord(
-                                                  waypoint1LatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  waypoint1LonController.text,
-                                                  isLat: false,
-                                                ).isFinite
-                                            ? _buildWindArrowMarkers(
-                                                'origin',
-                                                _parseCoord(
-                                                  waypoint1LatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  waypoint1LonController.text,
-                                                  isLat: false,
-                                                ),
-                                              )
-                                            : []),
-                                        ...(_parseCoord(
-                                                  waypoint2LatController.text,
-                                                  isLat: true,
-                                                ).isFinite &&
-                                                _parseCoord(
-                                                  waypoint2LonController.text,
-                                                  isLat: false,
-                                                ).isFinite
-                                            ? _buildWindArrowMarkers(
-                                                'origin',
-                                                _parseCoord(
-                                                  waypoint2LatController.text,
-                                                  isLat: true,
-                                                ),
-                                                _parseCoord(
-                                                  waypoint2LonController.text,
-                                                  isLat: false,
-                                                ),
-                                              )
-                                            : []),
-                                      ],
+                                          );
+                                        }
+                                        return ms;
+                                      }(),
                                     ),
                                   ],
                                 ),
@@ -2065,10 +2160,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         },
                       ),
                     ),
-                  // ...existing code...
-                  // ...continue with your form...
-                  // ...continue with your form...
-
+                  // ...existing code continues (coord fields)...
                   // --- End toggles ---
                   coordField(
                     'Origin Latitude',
@@ -2095,92 +2187,220 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     errorText: destLonError,
                   ),
 
-                  // Hospital waypoint toggle + its fields
+                  // Insert planner here:
+                  buildWaypointPlanner(),
+                  const SizedBox(height: 16),
+                  // Toggle to open the radial/distance → waypoint tool
                   SwitchListTile(
-                    title: const Text('Add Hospital Waypoint'),
-                    value: useHospitalWaypoint,
-                    onChanged: (v) => setState(() {
-                      useHospitalWaypoint = v;
-                      _validateAndDistance();
-                    }),
+                    title: const Text('Create waypoint from radial/distance'),
+                    value: showNavTool,
+                    onChanged: (v) => setState(() => showNavTool = v),
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
-                  if (useHospitalWaypoint) ...[
-                    coordField(
-                      'Hospital Latitude',
-                      hospitalLatController,
-                      isLat: true,
-                      errorText: hospitalLatError,
+                  if (showNavTool)
+                    Card(
+                      color: kPanelColor,
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'From known fix + radial/distance',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: DropdownButton<int>(
+                                    value: _selectedFixIndex,
+                                    isExpanded: true,
+                                    dropdownColor: kPanelColor,
+                                    items: [
+                                      for (int i = 0; i < kNavFixes.length; i++)
+                                        DropdownMenuItem(
+                                          value: i,
+                                          child: Text(
+                                            kNavFixes[i].name,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ),
+                                      const DropdownMenuItem(
+                                        value: -1, // _customBaseIndex
+                                        child: Text(
+                                          'Custom lat/lon…',
+                                          style: TextStyle(color: Colors.white),
+                                        ),
+                                      ),
+                                    ],
+                                    onChanged: (v) => setState(
+                                      () => _selectedFixIndex = v ?? 0,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                SizedBox(
+                                  width: 90,
+                                  child: TextField(
+                                    controller: _navRadialController,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Radial',
+                                      hintText: '0-360',
+                                      isDense: true,
+                                      border: OutlineInputBorder(),
+                                    ),
+                                    style: const TextStyle(color: Colors.white),
+                                    keyboardType: TextInputType.number,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                SizedBox(
+                                  width: 120,
+                                  child: TextField(
+                                    controller: _navDistanceController,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Distance (NM)',
+                                      isDense: true,
+                                      border: OutlineInputBorder(),
+                                    ),
+                                    style: const TextStyle(color: Colors.white),
+                                    keyboardType: TextInputType.number,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                ElevatedButton.icon(
+                                  onPressed: _computeNavFixPoint,
+                                  icon: const Icon(Icons.calculate),
+                                  label: const Text('Compute'),
+                                ),
+                              ],
+                            ),
+                            if (_selectedFixIndex == _customBaseIndex)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8.0),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: TextField(
+                                        controller: _navBaseLatController,
+                                        decoration: const InputDecoration(
+                                          labelText: 'Base Latitude',
+                                          hintText:
+                                              'e.g. 34 52 20 N or 34.8722',
+                                          isDense: true,
+                                          border: OutlineInputBorder(),
+                                        ),
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: TextField(
+                                        controller: _navBaseLonController,
+                                        decoration: const InputDecoration(
+                                          labelText: 'Base Longitude',
+                                          hintText:
+                                              'e.g. 033 37 28 E or 33.6244',
+                                          isDense: true,
+                                          border: OutlineInputBorder(),
+                                        ),
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: TextField(
+                                    readOnly: true,
+                                    controller: _navOutLatController,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Latitude (DMS)',
+                                      isDense: true,
+                                      border: OutlineInputBorder(),
+                                    ),
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: TextField(
+                                    readOnly: true,
+                                    controller: _navOutLonController,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Longitude (DMS)',
+                                      isDense: true,
+                                      border: OutlineInputBorder(),
+                                    ),
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 6,
+                              children: [
+                                OutlinedButton.icon(
+                                  icon: const Icon(Icons.copy),
+                                  label: const Text('Copy Lat'),
+                                  onPressed: () => Clipboard.setData(
+                                    ClipboardData(
+                                      text: _navOutLatController.text,
+                                    ),
+                                  ),
+                                ),
+                                OutlinedButton.icon(
+                                  icon: const Icon(Icons.copy),
+                                  label: const Text('Copy Lon'),
+                                  onPressed: () => Clipboard.setData(
+                                    ClipboardData(
+                                      text: _navOutLonController.text,
+                                    ),
+                                  ),
+                                ),
+                                OutlinedButton.icon(
+                                  icon: const Icon(Icons.call_made),
+                                  label: const Text('Send to Hospital'),
+                                  onPressed: () =>
+                                      _applyNavResultTo('hospital'),
+                                ),
+                                OutlinedButton.icon(
+                                  icon: const Icon(Icons.call_made),
+                                  label: const Text('Send to WP1'),
+                                  onPressed: () => _applyNavResultTo('wpt1'),
+                                ),
+                                OutlinedButton.icon(
+                                  icon: const Icon(Icons.call_made),
+                                  label: const Text('Send to WP2'),
+                                  onPressed: () => _applyNavResultTo('wpt2'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
-                    coordField(
-                      'Hospital Longitude',
-                      hospitalLonController,
-                      isLat: false,
-                      errorText: hospitalLonError,
-                    ),
-                  ],
-
-                  // Waypoint 1 toggle + its fields
-                  SwitchListTile(
-                    title: const Text('Waypoint 1'),
-                    value: useWaypoint1,
-                    onChanged: (v) {
-                      // update visibility first, then validate
-                      setState(() => useWaypoint1 = v);
-                      // quick console trace
-                      // ignore: avoid_print
-                      print('DEBUG: useWaypoint1 = $useWaypoint1');
-                      _validateAndDistance();
-                    },
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  // debug readout (remove after testing)
-                  Text(
-                    'DEBUG: useWaypoint1 = $useWaypoint1',
-                    style: const TextStyle(color: Colors.white70),
-                  ),
-                  if (useWaypoint1) ...[
-                    coordField(
-                      'Waypoint 1 Latitude',
-                      waypoint1LatController,
-                      isLat: true,
-                      errorText: waypoint1LatError,
-                    ),
-                    coordField(
-                      'Waypoint 1 Longitude',
-                      waypoint1LonController,
-                      isLat: false,
-                      errorText: waypoint1LonError,
-                    ),
-                  ],
-
-                  // Waypoint 2 toggle + its fields
-                  SwitchListTile(
-                    title: const Text('Waypoint 2'),
-                    value: useWaypoint2,
-                    onChanged: (v) => setState(() {
-                      useWaypoint2 = v;
-                      _validateAndDistance();
-                    }),
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  if (useWaypoint2) ...[
-                    coordField(
-                      'Waypoint 2 Latitude',
-                      waypoint2LatController,
-                      isLat: true,
-                      errorText: waypoint2LatError,
-                    ),
-                    coordField(
-                      'Waypoint 2 Longitude',
-                      waypoint2LonController,
-                      isLat: false,
-                      errorText: waypoint2LonError,
-                    ),
-                  ],
+                  // ...existing code...
                   const SizedBox(height: 16),
 
                   const SizedBox(height: 16),
@@ -2241,6 +2461,10 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                   );
                                 },
                               ),
+
+                            const SizedBox(height: 16),
+                            // ...existing code...
+                            // ...existing code...
                             if (!autoApplyAi)
                               Align(
                                 alignment: Alignment.centerLeft,
@@ -3492,44 +3716,43 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     // Parse coordinates
     final originLat = _parseCoord(originLatController.text, isLat: true);
     final originLon = _parseCoord(originLonController.text, isLat: false);
-    final w1Lat = _parseCoord(waypoint1LatController.text, isLat: true);
-    final w1Lon = _parseCoord(waypoint1LonController.text, isLat: false);
     final destLat = _parseCoord(destLatController.text, isLat: true);
     final destLon = _parseCoord(destLonController.text, isLat: false);
-    final hLat = _parseCoord(hospitalLatController.text, isLat: true);
-    final hLon = _parseCoord(hospitalLonController.text, isLat: false);
 
+    // Auto compute missionDistance (one-way) when enabled
     if (autoDistanceFromLatLon) {
-      // Build ordered sequence: Origin -> Hospital (if used) -> Waypoint1 (if used) -> Destination
-      double totalDistance = 0.0;
-      final seq = <LatLng>[];
+      final points = <LatLng>[];
       if (originLat.isFinite && originLon.isFinite) {
-        seq.add(LatLng(originLat, originLon));
+        points.add(LatLng(originLat, originLon));
       }
-      if (useHospitalWaypoint && hLat.isFinite && hLon.isFinite) {
-        seq.add(LatLng(hLat, hLon));
-      }
-      if (useWaypoint1 && w1Lat.isFinite && w1Lon.isFinite) {
-        seq.add(LatLng(w1Lat, w1Lon));
+      // Use draggable mid-route waypoints in current order
+      for (final wp in _waypoints) {
+        if (!wp.enabled) continue;
+        final wLat = _parseCoord(wp.lat.text, isLat: true);
+        final wLon = _parseCoord(wp.lon.text, isLat: false);
+        if (wLat.isFinite && wLon.isFinite) {
+          points.add(LatLng(wLat, wLon));
+        }
       }
       if (destLat.isFinite && destLon.isFinite) {
-        seq.add(LatLng(destLat, destLon));
+        points.add(LatLng(destLat, destLon));
       }
 
-      if (seq.length >= 2) {
-        for (int i = 0; i < seq.length - 1; i++) {
-          totalDistance += _gcDistanceNm(
-            seq[i].latitude,
-            seq[i].longitude,
-            seq[i + 1].latitude,
-            seq[i + 1].longitude,
+      if (points.length >= 2) {
+        double total = 0.0;
+        for (int i = 0; i < points.length - 1; i++) {
+          total += _gcDistanceNm(
+            points[i].latitude,
+            points[i].longitude,
+            points[i + 1].latitude,
+            points[i + 1].longitude,
           );
         }
-        missionDistance = totalDistance;
-        missionDistanceController.text = totalDistance.toStringAsFixed(0);
+        missionDistanceController.text = total.toStringAsFixed(0);
+        missionDistance = total;
       }
-      // if seq < 2 we leave missionDistance as parsed from the input field
     }
+    // ...existing code...
     // ...existing code...
     // Base performance (may change if AI auto-applies)
     var perf = calculateCruisePerformance(

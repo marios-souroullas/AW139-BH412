@@ -2,6 +2,10 @@ import 'dart:typed_data';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'dart:io';
+import 'package:flutter/widgets.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:path_provider/path_provider.dart';
 
 double kgToLbs(double kg) => kg * 2.2046226218;
 
@@ -316,9 +320,33 @@ class CruiseReportExporter {
     await Printing.layoutPdf(onLayout: (_) async => data);
   }
 
-  static Future<void> share(CruiseReportData d) async {
-    final data = await buildPdf(d);
-    await Printing.sharePdf(bytes: data, filename: 'aw139_cruise_report.pdf');
+  static Future<void> share(BuildContext context, CruiseReportData data) async {
+    // Get popover anchor BEFORE awaits (fixes use_build_context_synchronously)
+    final box = context.findRenderObject() as RenderBox?;
+    final origin = box != null
+        ? box.localToGlobal(Offset.zero) & box.size
+        : const Rect.fromLTWH(0, 0, 0, 0);
+
+    // Build and persist the PDF
+    final bytes = await buildPdf(data);
+    final dir = await getTemporaryDirectory();
+    final path = '${dir.path}/AW139_Cruise_Report.pdf';
+    await File(path).writeAsBytes(bytes, flush: true);
+
+    final file = XFile(
+      path,
+      name: 'AW139_Cruise_Report.pdf',
+      mimeType: 'application/pdf',
+    );
+
+    // Use legacy API, suppress deprecation warning
+    // ignore: deprecated_member_use
+    await Share.shareXFiles(
+      [file],
+      subject: 'AW139 Cruise Report',
+      text: 'AW139 Cruise Report attached.',
+      sharePositionOrigin: origin, // iPad popover anchor
+    );
   }
 
   // Simple winds-only table (Altitude ft, Tailwind kt)

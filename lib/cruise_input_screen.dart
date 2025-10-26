@@ -6,7 +6,10 @@ import 'package:aw139_cruise/export/cruise_report_export.dart'; // <-- add this 
 import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
 import 'package:flutter/services.dart'
     show rootBundle, Clipboard, ClipboardData;
-import 'dart:convert';
+import 'package:aw139_cruise/export/route_export_kml.dart';
+import 'dart:convert' show utf8, jsonDecode, JsonEncoder;
+import 'dart:typed_data' show Uint8List;
+import 'package:file_selector/file_selector.dart';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
@@ -19,6 +22,51 @@ enum WindProvider { openMeteo, windy }
 
 // AI optimization objective
 enum OptimizationObjective { minFuel, minTime, hybrid }
+
+// SAR pattern types
+enum SarPatternType { parallel, expandingSquare, sector }
+
+// + Per‑waypoint SAR parameters (units in NM and degrees)
+class SarParams {
+  double headingDeg; // first heading or start bearing
+  // Parallel
+  double legNm;
+  double spacingNm;
+  int legs;
+  // Expanding square
+  double stepNm;
+  int layers;
+  // Sector
+  double radiusNm;
+  int sectors;
+
+  SarParams({
+    this.headingDeg = double.nan, // NaN means "use route"
+    this.legNm = 2.0,
+    this.spacingNm = 0.5,
+    this.legs = 6,
+    this.stepNm = 0.5,
+    this.layers = 4,
+    this.radiusNm = 2.0,
+    this.sectors = 6,
+  });
+
+  static SarParams defaultsFor(SarPatternType t) {
+    switch (t) {
+      case SarPatternType.parallel:
+        return SarParams(
+          headingDeg: double.nan,
+          legNm: 2.0,
+          spacingNm: 0.5,
+          legs: 6,
+        );
+      case SarPatternType.expandingSquare:
+        return SarParams(headingDeg: double.nan, stepNm: 0.5, layers: 4);
+      case SarPatternType.sector:
+        return SarParams(headingDeg: double.nan, radiusNm: 2.0, sectors: 6);
+    }
+  }
+}
 
 // OpenWeatherMap API key (replace with your OpenWeatherMap key).
 // Do NOT commit this value to a public repo.
@@ -305,6 +353,46 @@ double _numToDouble(dynamic v) {
   return double.tryParse(v.toString()) ?? 0.0;
 }
 
+// PNR helpers
+double _computePnrNm({
+  required double fuelOnboardKg,
+  required double reserveKg,
+  required double hoistMinutes,
+  required double burnKgPerHr,
+  required double gsOutKts,
+  required double gsBackKts,
+}) {
+  const hoistBurnKgPerHr = 450.0;
+  final hoistKg = (hoistMinutes / 60.0) * hoistBurnKgPerHr;
+  final usableKg = (fuelOnboardKg - reserveKg - hoistKg).clamp(
+    0.0,
+    fuelOnboardKg,
+  );
+  if (burnKgPerHr <= 0) return 0.0;
+  final usableHr = usableKg / burnKgPerHr;
+  final denom = (1.0 / gsOutKts) + (1.0 / gsBackKts);
+  if (denom <= 0) return 0.0;
+  return usableHr / denom;
+}
+
+LatLng? _pointAlongRoute(List<LatLng> pts, double targetNm) {
+  if (pts.length < 2 || targetNm <= 0) return pts.isNotEmpty ? pts.first : null;
+  double acc = 0.0;
+  for (int i = 0; i < pts.length - 1; i++) {
+    final a = pts[i], b = pts[i + 1];
+    final seg = _gcDistanceNm(a.latitude, a.longitude, b.latitude, b.longitude);
+    if (acc + seg >= targetNm) {
+      final remain = targetNm - acc;
+      final t = (seg > 0 ? remain / seg : 0).clamp(0.0, 1.0);
+      final lat = a.latitude + (b.latitude - a.latitude) * t;
+      final lon = a.longitude + (b.longitude - a.longitude) * t;
+      return LatLng(lat, lon);
+    }
+    acc += seg;
+  }
+  return pts.last;
+}
+
 // ...existing code...
 // convert pressure (hPa) -> approximate altitude (ft) using ISA barometric formula
 double pressureHpaToFeet(
@@ -355,6 +443,9 @@ void showCruiseResultsDialog({
   double? destLon,
   bool roundTrip = true,
   bool isBell412 = false,
+  double? sarDistanceNm, // one-way SAR distance included in missionDistance
+  double? sarTimeHours, // total added time (out + back if roundTrip)
+  double? sarFuelKg, // added fuel for SAR (kg)
 }) {
   // Units shown to the user
   final weightUnit = isBell412 ? 'lbs' : 'kg';
@@ -366,6 +457,9 @@ void showCruiseResultsDialog({
   final displayFuelRem = isBell412 ? kgToLbs(fuelRemaining) : fuelRemaining;
   final displayFuelReq = isBell412 ? kgToLbs(fuelRequired) : fuelRequired;
   final fuelRemRoundedDisplay = displayFuelRem.round();
+  final displaySarFuel = (sarFuelKg != null)
+      ? (isBell412 ? kgToLbs(sarFuelKg) : sarFuelKg)
+      : null;
 
   // Color thresholds in display units (lbs for 412, kg for 139)
   final redThresh = isBell412 ? kgToLbs(184) : 184.0;
@@ -403,6 +497,30 @@ void showCruiseResultsDialog({
                   )
                 else
                   const Text('Return leg not included (single trip)'),
+                if ((sarDistanceNm ?? 0) > 0) ...[
+                  const SizedBox(height: 6),
+                  const Divider(thickness: 1, color: Colors.grey),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'SAR Breakdown',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    'SAR distance (one-way): ${sarDistanceNm!.toStringAsFixed(0)} NM',
+                  ),
+                  Text(
+                    'SAR time added: ${(sarTimeHours ?? 0).toStringAsFixed(2)} hrs',
+                  ),
+                  if (displaySarFuel != null)
+                    Text(
+                      'SAR fuel: ${displaySarFuel.toStringAsFixed(0)} ${isBell412 ? 'lbs' : 'kg'}',
+                    ),
+                  // Optional: show base distance (one-way without SAR)
+                  Text(
+                    'Base route (one-way, no SAR): ${(missionDistance - sarDistanceNm).clamp(0, double.infinity).toStringAsFixed(0)} NM',
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                ],
                 Text(
                   'Mission Duration: ${missionDuration.toStringAsFixed(2)} hrs',
                 ),
@@ -501,7 +619,7 @@ void showCruiseResultsDialog({
                   ),
                 // ...existing code...
                 // ...existing code...
-                if (lowFuelWarning)
+                if (lowFuelWarning) ...[
                   const Padding(
                     padding: EdgeInsets.only(top: 8),
                     child: Text(
@@ -512,6 +630,7 @@ void showCruiseResultsDialog({
                       ),
                     ),
                   ),
+                ],
 
                 // ...existing code...
                 const SizedBox(height: 12),
@@ -915,7 +1034,6 @@ class NavFix {
 }
 
 const List<NavFix> kNavFixes = [
-  // TODO: Replace with your real reference points
   NavFix(id: 'LCA', name: 'Larnaca VOR/DME (LCA)', lat: 34.8723, lon: 33.6243),
   NavFix(id: 'PHA', name: 'Paphos VOR/DME (PHA)', lat: 34.7117, lon: 32.5058),
 ];
@@ -942,7 +1060,8 @@ class CruiseInputScreen extends StatefulWidget {
   State<CruiseInputScreen> createState() => CruiseInputScreenState();
 }
 
-class CruiseInputScreenState extends State<CruiseInputScreen> {
+class CruiseInputScreenState extends State<CruiseInputScreen>
+    with SingleTickerProviderStateMixin {
   // Core numeric state
   double cruiseSpeed = 130;
   double missionDistance = 100;
@@ -976,11 +1095,446 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   final waypoint2LatController = TextEditingController();
   final waypoint2LonController = TextEditingController();
 
+  final Map<String, TextEditingController> _sarHeadingCtrls = {};
+  final MapController _mapController = MapController();
+
+  bool showSarLabels = true;
+  bool includeSarInPnr = true;
+  bool _headingUp = false;
+
   // Flags for optional waypoints
   bool useWaypoint1 = false;
   bool useHospitalWaypoint = false;
   bool useWaypoint2 = false;
   // (removed duplicate small build — full build method appears later)
+  // SAR pattern state: per-waypoint generated paths and chosen type
+  final Map<String, List<LatLng>> _sarPatternByWp = {};
+  final Map<String, SarPatternType> _patternTypeByWp = {};
+
+  final Map<String, SarParams> _sarParamsByWp = {};
+  double _normHdg(double v) {
+    if (!v.isFinite) return v;
+    final n = v % 360.0;
+    return n < 0 ? n + 360.0 : n;
+  }
+
+  // Ensure params exist for a waypoint for current type
+  SarParams _ensureSarParams(String wpId, SarPatternType t) {
+    final cur = _sarParamsByWp[wpId];
+    if (cur != null) return cur;
+    final def = SarParams.defaultsFor(t);
+    _sarParamsByWp[wpId] = def;
+    return def;
+  }
+
+  // Small numeric fields for SAR params
+  Widget _sarNumberField({
+    required String label,
+    required double value,
+    required void Function(double) onChanged,
+    double width = 90,
+    int decimals = 1,
+  }) {
+    final ctrl = TextEditingController(
+      text: value.isFinite ? value.toStringAsFixed(decimals) : '',
+    );
+    return SizedBox(
+      width: width,
+      child: TextField(
+        controller: ctrl,
+        keyboardType: TextInputType.number,
+        style: const TextStyle(color: Colors.white),
+        decoration: InputDecoration(
+          labelText: label,
+          isDense: true,
+          border: const OutlineInputBorder(),
+        ),
+        onChanged: (s) => onChanged(_parseNumber(s)),
+      ),
+    );
+  }
+
+  Widget _sarIntField({
+    required String label,
+    required int value,
+    required void Function(int) onChanged,
+    double width = 90,
+  }) {
+    final ctrl = TextEditingController(text: value.toString());
+    return SizedBox(
+      width: width,
+      child: TextField(
+        controller: ctrl,
+        keyboardType: TextInputType.number,
+        style: const TextStyle(color: Colors.white),
+        decoration: InputDecoration(
+          labelText: label,
+          isDense: true,
+          border: const OutlineInputBorder(),
+        ),
+        onChanged: (s) => onChanged(_parseNumber(s).round()),
+      ),
+    );
+  }
+
+  LatLng? _aircraftPosition;
+  double _aircraftHeading = 0.0;
+  Timer? _simTimer;
+
+  // ...inside CruiseInputScreenState...
+  LatLng? _aircraftAnimFrom;
+  LatLng? _aircraftAnimTo;
+  double _aircraftAnimT = 1.0; // 1.0 = at "to" position
+  AnimationController? _aircraftAnimController;
+
+  // Geo forward solver reused for SAR legs (bearing deg, distance NM)
+  LatLng _fwd(LatLng p, double bearingDeg, double distNm) =>
+      _destinationPointFromRadialNm(
+        latDeg: p.latitude,
+        lonDeg: p.longitude,
+        radialDeg: bearingDeg,
+        distanceNm: distNm,
+      );
+
+  // Helper: append pattern pts (skip first if same anchor) into pts
+  void _appendPatternIfAny(List<LatLng> pts, String wpId, LatLng anchor) {
+    final pat = _sarPatternByWp[wpId];
+    if (pat == null || pat.isEmpty) return;
+    final start = pat.first;
+    // avoid duplicating the anchor point
+    final iterable =
+        (start.latitude == anchor.latitude &&
+            start.longitude == anchor.longitude)
+        ? pat.skip(1)
+        : pat;
+    pts.addAll(iterable);
+  }
+
+  void _clearSarFor(String wpId) {
+    setState(() {
+      _sarPatternByWp.remove(wpId); // remove generated geometry
+      // reset params to defaults for current type
+      final t = _patternTypeByWp[wpId] ?? SarPatternType.parallel;
+      _sarParamsByWp[wpId] = SarParams.defaultsFor(t);
+      // clear heading textbox if any
+      _sarHeadingCtrls[wpId]?.text = '';
+    });
+    _validateAndDistance(); // recompute route length without the pattern
+  }
+
+  Future<void> _startGpsTracking() async {
+    final ok = await _ensureLocationPermission();
+    if (!ok) return;
+    Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+    ).listen((pos) {
+      setState(() {
+        _aircraftPosition = LatLng(pos.latitude, pos.longitude);
+        _aircraftHeading = pos.heading.isFinite ? pos.heading : 0.0;
+      });
+      if (_autoCenterEnabled && _aircraftPosition != null) {
+        _mapController.move(_aircraftPosition!, _mapController.camera.zoom);
+      }
+    });
+  }
+
+  void _startSimulation() {
+    _simTimer?.cancel();
+
+    // Build the planned route as a list of LatLngs
+    final pts = <LatLng>[];
+    final oLat = _parseCoord(originLatController.text, isLat: true);
+    final oLon = _parseCoord(originLonController.text, isLat: false);
+    final dLat = _parseCoord(destLatController.text, isLat: true);
+    final dLon = _parseCoord(destLonController.text, isLat: false);
+    if (oLat.isFinite && oLon.isFinite) {
+      pts.add(LatLng(oLat, oLon));
+    }
+    for (final wp in _waypoints) {
+      if (!wp.enabled) continue;
+      final wLat = _parseCoord(wp.lat.text, isLat: true);
+      final wLon = _parseCoord(wp.lon.text, isLat: false);
+      if (wLat.isFinite && wLon.isFinite) {
+        final anchor = LatLng(wLat, wLon);
+        pts.add(anchor);
+        _appendPatternIfAny(pts, wp.id, anchor);
+      }
+    }
+    if (dLat.isFinite && dLon.isFinite) {
+      pts.add(LatLng(dLat, dLon));
+    }
+    if (pts.length < 2) return;
+
+    int segIdx = 0;
+    double segT = 0.0;
+    const speedNmPerSec = 70.0 / 3600.0; // 70 knots in NM/sec
+    LatLng pos = pts[0];
+
+    _aircraftPosition = pos;
+    _aircraftHeading = _initialBearingDeg(
+      pts[0].latitude,
+      pts[0].longitude,
+      pts[1].latitude,
+      pts[1].longitude,
+    );
+
+    _simTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (segIdx >= pts.length - 1) return;
+      final a = pts[segIdx];
+      final b = pts[segIdx + 1];
+      final segLen = _gcDistanceNm(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+      if (segLen == 0) {
+        segIdx++;
+        segT = 0.0;
+        return;
+      }
+      final step = speedNmPerSec / segLen;
+      segT += step;
+      if (segT >= 1.0) {
+        segIdx++;
+        segT = 0.0;
+        if (segIdx >= pts.length - 1) {
+          setState(() {
+            _aircraftPosition = pts.last;
+          });
+          return;
+        }
+      }
+      final lat = a.latitude + (b.latitude - a.latitude) * segT;
+      final lon = a.longitude + (b.longitude - a.longitude) * segT;
+      final hdg = _initialBearingDeg(
+        a.latitude,
+        a.longitude,
+        b.latitude,
+        b.longitude,
+      );
+      final newPos = LatLng(lat, lon);
+      _aircraftAnimFrom = _aircraftPosition ?? newPos;
+      _aircraftAnimTo = newPos;
+      _aircraftAnimController?.reset();
+      _aircraftAnimController?.forward();
+      _aircraftPosition = newPos;
+      _aircraftHeading = hdg;
+      if (kDebugMode) {
+        print('Simulated aircraft position: $_aircraftPosition');
+      }
+      if (_autoCenterEnabled && _aircraftPosition != null) {
+        _mapController.move(_aircraftPosition!, _mapController.camera.zoom);
+      }
+    });
+  }
+
+  void _stopSimulation() {
+    _simTimer?.cancel();
+    _simTimer = null;
+  }
+
+  // Build a lawnmower (parallel track) starting at anchor, along trackDeg
+  List<LatLng> _buildParallelTrack({
+    required LatLng anchor,
+    required double trackDeg,
+    required double legNm,
+    required double spacingNm,
+    required int legs,
+  }) {
+    final List<LatLng> out = [anchor];
+    if (legs <= 0 || legNm <= 0 || spacingNm < 0) return out;
+    final fwd = trackDeg % 360.0;
+    final back = (fwd + 180.0) % 360.0;
+    final right = (fwd + 90.0) % 360.0;
+    LatLng cur = anchor;
+    bool forward = true;
+    for (int i = 0; i < legs; i++) {
+      // run leg
+      cur = _fwd(cur, forward ? fwd : back, legNm);
+      out.add(cur);
+      // offset to next lane (except after last leg)
+      if (i != legs - 1) {
+        cur = _fwd(cur, right, spacingNm);
+        out.add(cur);
+      }
+      forward = !forward;
+    }
+    return out;
+  }
+
+  // Expanding square centered at anchor. stepNm is the first leg; grows each 2 legs.
+  List<LatLng> _buildExpandingSquare({
+    required LatLng anchor,
+    required double initialBearingDeg,
+    required double stepNm,
+    required int layers,
+  }) {
+    final List<LatLng> out = [anchor];
+    if (layers <= 0 || stepNm <= 0) return out;
+    LatLng cur = anchor;
+    double bearing = initialBearingDeg % 360.0;
+    double leg = stepNm;
+    for (int layer = 0; layer < layers; layer++) {
+      // two legs of current length
+      for (int k = 0; k < 2; k++) {
+        cur = _fwd(cur, bearing, leg);
+        out.add(cur);
+        bearing = (bearing + 90.0) % 360.0;
+      }
+      // increase leg after two legs
+      leg += stepNm;
+      // two legs of new length
+      for (int k = 0; k < 2; k++) {
+        cur = _fwd(cur, bearing, leg);
+        out.add(cur);
+        bearing = (bearing + 90.0) % 360.0;
+      }
+      leg += stepNm;
+    }
+    // Optionally return to center (commented out)
+    // out.add(anchor);
+    return out;
+  }
+
+  // Sector search: radiate out-and-back from center across sectors
+  List<LatLng> _buildSector({
+    required LatLng anchor,
+    required double radiusNm,
+    required double startBearingDeg,
+    required int sectors,
+  }) {
+    // Normalize
+    final start = _normHdg(startBearingDeg);
+    final step = 360.0 / (sectors.clamp(1, 36));
+    final pts = <LatLng>[];
+    // For each sector: out to rim, back to center, arc to next spoke
+    for (int i = 0; i < sectors; i++) {
+      final b0 = _normHdg(start + i * step);
+      final b1 = _normHdg(start + (i + 1) * step);
+      // Out
+      final rim = _fwd(anchor, b0, radiusNm);
+      if (pts.isEmpty) pts.add(anchor);
+      pts.add(rim);
+      // Back to center
+      pts.add(anchor);
+      // Arc along the rim to next sector (connectors)
+      pts.addAll(
+        _arcPoints(
+          center: anchor,
+          startBearingDeg: b0,
+          endBearingDeg: b1,
+          radiusNm: radiusNm,
+          steps: 10,
+        ),
+      );
+      // Ensure next leg starts from rim of next spoke (nice visual continuity)
+      final nextRim = _fwd(anchor, b1, radiusNm);
+      pts.add(nextRim);
+      // And return to center so the next loop continues cleanly
+      pts.add(anchor);
+    }
+    return pts;
+  }
+
+  // Generate points along a circular arc at constant radius from center
+  List<LatLng> _arcPoints({
+    required LatLng center,
+    required double startBearingDeg,
+    required double endBearingDeg,
+    required double radiusNm,
+    int steps = 8,
+  }) {
+    // Move counter-clockwise from start to end
+    var a0 = _normHdg(startBearingDeg);
+    var a1 = _normHdg(endBearingDeg);
+    var delta = a1 - a0;
+    if (delta <= 0) delta += 360.0;
+
+    final out = <LatLng>[];
+    for (int i = 1; i <= steps; i++) {
+      final a = a0 + delta * (i / steps);
+      out.add(_fwd(center, a, radiusNm));
+    }
+    return out;
+  }
+
+  // Generate pattern for a waypoint id using defaults
+  void _generateSarFor(String wpId) {
+    final wp = _waypoints.firstWhere(
+      (w) => w.id == wpId,
+      orElse: () => WaypointItem(
+        id: '',
+        title: '',
+        lat: TextEditingController(),
+        lon: TextEditingController(),
+      ),
+    );
+    if (wp.id.isEmpty) return;
+    final wLat = _parseCoord(wp.lat.text, isLat: true);
+    final wLon = _parseCoord(wp.lon.text, isLat: false);
+    if (!(wLat.isFinite && wLon.isFinite)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Enter valid ${wp.title} coordinates')),
+      );
+      return;
+    }
+    // Base track from origin->dest if available, else 0°
+    final oLat = _parseCoord(originLatController.text, isLat: true);
+    final oLon = _parseCoord(originLonController.text, isLat: false);
+    final dLat = _parseCoord(destLatController.text, isLat: true);
+    final dLon = _parseCoord(destLonController.text, isLat: false);
+    final trackDeg =
+        (oLat.isFinite && oLon.isFinite && dLat.isFinite && dLon.isFinite)
+        ? _initialBearingDeg(oLat, oLon, dLat, dLon)
+        : 0.0;
+
+    final anchor = LatLng(wLat, wLon);
+    final typ = _patternTypeByWp[wpId] ?? SarPatternType.parallel;
+    final p = _ensureSarParams(wpId, typ);
+
+    // Conservative defaults
+    late final List<LatLng> pts;
+    switch (typ) {
+      case SarPatternType.parallel:
+        pts = _buildParallelTrack(
+          anchor: anchor,
+          trackDeg: p.headingDeg.isFinite ? _normHdg(p.headingDeg) : trackDeg,
+          legNm: (p.legNm > 0 ? p.legNm : 2.0),
+          spacingNm: (p.spacingNm >= 0 ? p.spacingNm : 0.5),
+          legs: (p.legs > 0 ? p.legs : 6),
+        );
+        break;
+      case SarPatternType.expandingSquare:
+        pts = _buildExpandingSquare(
+          anchor: anchor,
+          initialBearingDeg: p.headingDeg.isFinite
+              ? _normHdg(p.headingDeg)
+              : trackDeg,
+          stepNm: (p.stepNm > 0 ? p.stepNm : 0.5),
+          layers: (p.layers > 0 ? p.layers : 4),
+        );
+        break;
+      case SarPatternType.sector:
+        pts = _buildSector(
+          anchor: anchor,
+          radiusNm: (p.radiusNm > 0 ? p.radiusNm : 2.0),
+          startBearingDeg: p.headingDeg.isFinite
+              ? _normHdg(p.headingDeg)
+              : trackDeg,
+          sectors: (p.sectors > 0 ? p.sectors : 6),
+        );
+        break;
+    }
+    setState(() {
+      _sarPatternByWp[wpId] = pts;
+      // Ensure the wp is enabled (so route includes it)
+      wp.enabled = true;
+      _syncWaypointFlagsFromList();
+    });
+    // Recompute route distance including pattern
+    _validateAndDistance();
+  }
 
   // Coordinate validation errors for the extra waypoints
   String? waypoint1LatError,
@@ -1023,13 +1577,15 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   bool _calculating = false;
   bool autoApplyAi = true;
   bool keepDmsFormat = true;
+  bool _autoCenterEnabled = true;
+  bool _simulateAircraft = false;
 
   // Coordinate validation errors
   String? originLatError, originLonError, destLatError, destLonError;
   // ignore: unused_field
   CruiseReportData? _lastReport;
 
-  // AI suggestions
+  // AI suggestionsExport KML/Share/Print
   double? _aiSuggestedAltitudeFt;
   double? _aiSuggestedAltitudeOutFt;
   double? _aiSuggestedAltitudeBackFt;
@@ -1037,6 +1593,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   double? _aiTailwindOutKts;
   double? _aiTailwindBackKts;
   double? _aiSuggestedIas;
+
+  double reserveFuel = 184; // kg default (≈ final reserve for AW139)
+  final reserveController = TextEditingController(text: '184');
+
+  double? _pnrNm; // Point of No Return distance from origin (NM)
+  LatLng? _pnrPoint; // Geographic position along route for map pin
 
   // Nav tool controllers/state
   final _navRadialController = TextEditingController(text: '090');
@@ -1134,7 +1696,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         case 'hospital':
           hospitalLatController.text = latDms;
           hospitalLonController.text = lonDms;
-          useHospitalWaypoint = true;
+          useHospitalWaypoint = true; // add braces
           break;
         case 'wpt1':
           waypoint1LatController.text = latDms;
@@ -1144,7 +1706,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         case 'wpt2':
           waypoint2LatController.text = latDms;
           waypoint2LonController.text = lonDms;
-          useWaypoint2 = true;
+          useWaypoint2 = true; // add braces
           break;
       }
       for (final wp in _waypoints) {
@@ -1194,6 +1756,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
   // Store wind profile arrays fetched per key (e.g. 'origin','dest')
   final Map<String, List<Map<String, double>>> _fetchedWindLevelsByKey = {};
 
+  String _mapEditTarget = 'wpt1';
+
   // Draggable mid-route waypoints (Hospital / WP1 / WP2)
   late List<WaypointItem> _waypoints;
 
@@ -1209,26 +1773,18 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     final wind = _interpolateWind(alt, levels);
     final dirFrom = (wind['dirFrom'] ?? 0.0);
     final speed = (wind['speed'] ?? 0.0);
-    // Wind "to" is from + 180
     final windToDeg = (dirFrom + 180.0) % 360.0;
     final angle = _degToRad(windToDeg);
-    // make arrows larger & high-contrast for easy visibility
     final size = (speed * 8.0 + 32.0).clamp(20.0, 96.0);
-
-    // DEBUG: print when building arrow markers
-    // ignore: avoid_print
-    print(
-      'WIND_ARROW build key=$key lat=${lat.toStringAsFixed(6)} lon=${lon.toStringAsFixed(6)} alt=$alt speed=${speed.toStringAsFixed(2)} dirFrom=${dirFrom.toStringAsFixed(1)} windTo=$windToDeg size=$size',
-    );
 
     return [
       Marker(
         point: LatLng(lat, lon),
         width: size,
         height: size,
+        // builder -> child (your flutter_map needs child:)
         child: Container(
           alignment: Alignment.center,
-          // dark circular backdrop so the yellow arrow is visible on any tile
           decoration: BoxDecoration(
             color: Colors.black54,
             shape: BoxShape.circle,
@@ -1245,6 +1801,156 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
         ),
       ),
     ];
+  }
+
+  // Build PNR marker list (typed)
+  List<Marker> _buildPnrMarkers() {
+    if (_pnrPoint == null || _pnrNm == null || _pnrNm! <= 0) {
+      return const <Marker>[];
+    }
+    return <Marker>[
+      Marker(
+        point: _pnrPoint!,
+        width: 36,
+        height: 36,
+        // builder -> child
+        child: const Icon(Icons.pin_drop, color: Colors.amber, size: 32),
+      ),
+    ];
+  }
+
+  // Assign a distinct color per waypoint
+  Color _sarColorFor(String wpId) {
+    switch (wpId) {
+      case 'hospital':
+        return Colors.pinkAccent;
+      case 'wpt1':
+        return Colors.cyanAccent;
+      case 'wpt2':
+        return Colors.orangeAccent;
+      default:
+        return Colors.amberAccent;
+    }
+  }
+
+  List<Polyline> _buildSarPolylines() {
+    final lines = <Polyline>[];
+    _sarPatternByWp.forEach((wpId, pts) {
+      if (pts.length >= 2) {
+        // Outline (below)
+        lines.add(
+          Polyline(
+            points: pts,
+            color: Colors.black.withValues(alpha: 0.40),
+            strokeWidth: 6,
+          ),
+        );
+        // Colored main line (above)
+        lines.add(
+          Polyline(
+            points: pts,
+            color: _sarColorFor(wpId).withValues(alpha: 0.95),
+            strokeWidth: 3,
+          ),
+        );
+      }
+    });
+    return lines;
+  }
+
+  List<Marker> _buildSarLabelMarkers() {
+    final ms = <Marker>[];
+    _sarPatternByWp.forEach((wpId, pts) {
+      if (pts.isEmpty) return;
+      final col = _sarColorFor(wpId);
+
+      Widget chip(String text) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.black54,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: col, width: 1.2),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(color: col, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              text,
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          ],
+        ),
+      );
+
+      // START at first point
+      ms.add(
+        Marker(
+          point: pts.first,
+          width: 140,
+          height: 28,
+          child: chip('START: ${wpId.toUpperCase()}'),
+        ),
+      );
+
+      // END at last point (skip if same as start)
+      final last = pts.last;
+      if (last.latitude != pts.first.latitude ||
+          last.longitude != pts.first.longitude) {
+        ms.add(Marker(point: last, width: 120, height: 28, child: chip('END')));
+      }
+    });
+    return ms;
+  }
+
+  // Replace your existing _sarArrowMarkers with this colored version
+  List<Marker> _sarArrowMarkers() {
+    const minSegNm = 0.2;
+    final markers = <Marker>[];
+    _sarPatternByWp.forEach((wpId, pts) {
+      final col = _sarColorFor(wpId);
+      for (int i = 0; i + 1 < pts.length; i++) {
+        final a = pts[i];
+        final b = pts[i + 1];
+        final dNm = _gcDistanceNm(
+          a.latitude,
+          a.longitude,
+          b.latitude,
+          b.longitude,
+        );
+        if (dNm < minSegNm) continue;
+
+        final mid = LatLng(
+          (a.latitude + b.latitude) / 2.0,
+          (a.longitude + b.longitude) / 2.0,
+        );
+        final brg = _initialBearingDeg(
+          a.latitude,
+          a.longitude,
+          b.latitude,
+          b.longitude,
+        );
+        final rad = _degToRad(brg);
+
+        markers.add(
+          Marker(
+            point: mid,
+            width: 18,
+            height: 18,
+            child: Transform.rotate(
+              angle: rad,
+              child: Icon(Icons.arrow_right_alt, size: 18, color: col),
+            ),
+          ),
+        );
+      }
+    });
+    return markers;
   }
 
   Map<String, double> _tailOutBack(
@@ -1307,6 +2013,14 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     )]!;
   }
 
+  // Add helper in CruiseInputScreenState
+  LatLng _safeMapCenter() {
+    final lat = _parseCoord(originLatController.text, isLat: true);
+    final lon = _parseCoord(originLonController.text, isLat: false);
+    if (lat.isFinite && lon.isFinite) return LatLng(lat, lon);
+    return const LatLng(34.8723, 33.6243); // fallback: LCA area
+  }
+
   // Class-level wind interpolator used by _tailOutBack and AI helpers
   Map<String, double> _interpolateWind(
     double altFt,
@@ -1347,6 +2061,18 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     super.initState();
     // load BH412 performance table (safe to call even if asset missing)
     loadBh412TablesFromAsset();
+
+    _aircraftAnimController =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 800),
+        )..addListener(() {
+          if (_aircraftAnimFrom != null && _aircraftAnimTo != null) {
+            setState(() {
+              _aircraftAnimT = _aircraftAnimController!.value;
+            });
+          }
+        });
 
     // controller initialization
     cruiseSpeedController.text = cruiseSpeed.toStringAsFixed(0);
@@ -1409,6 +2135,10 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     _navBaseLatController.dispose();
     _navBaseLonController.dispose();
     super.dispose();
+    // Dispose SAR heading text controllers
+    for (final c in _sarHeadingCtrls.values) {
+      c.dispose();
+    }
   }
 
   // ---------- Coordinate Handling ----------
@@ -1492,11 +2222,15 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       }
       // Use draggable mid-route waypoints in current order
       for (final wp in _waypoints) {
-        if (!wp.enabled) continue;
+        if (!wp.enabled) {
+          continue;
+        }
         final wLat = _parseCoord(wp.lat.text, isLat: true);
         final wLon = _parseCoord(wp.lon.text, isLat: false);
         if (wLat.isFinite && wLon.isFinite) {
-          points.add(LatLng(wLat, wLon));
+          final anchor = LatLng(wLat, wLon);
+          points.add(anchor);
+          _appendPatternIfAny(points, wp.id, anchor);
         }
       }
       if (dLat.isFinite && dLon.isFinite) {
@@ -1589,6 +2323,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         ),
                       ],
                     ),
+                    // ...inside buildWaypointPlanner() -> ListTile(...),
                     subtitle: wp.enabled
                         ? Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1604,6 +2339,250 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                                 wp.lon,
                                 isLat: false,
                                 errorText: null,
+                              ),
+                              // SAR pattern controls
+                              Padding(
+                                padding: const EdgeInsets.only(top: 6.0),
+                                child: Row(
+                                  children: [
+                                    const Text(
+                                      'SAR:',
+                                      style: TextStyle(color: Colors.white70),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    DropdownButton<SarPatternType>(
+                                      value:
+                                          _patternTypeByWp[wp.id] ??
+                                          SarPatternType.parallel,
+                                      dropdownColor: kPanelColor,
+                                      items: const [
+                                        DropdownMenuItem(
+                                          value: SarPatternType.parallel,
+                                          child: Text(
+                                            'Parallel Track',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ),
+                                        DropdownMenuItem(
+                                          value: SarPatternType.expandingSquare,
+                                          child: Text(
+                                            'Expanding Square',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ),
+                                        DropdownMenuItem(
+                                          value: SarPatternType.sector,
+                                          child: Text(
+                                            'Sector',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                      onChanged: (v) => setState(() {
+                                        if (v != null) {
+                                          _patternTypeByWp[wp.id] = v;
+                                        }
+                                      }),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    OutlinedButton(
+                                      onPressed: () => _generateSarFor(wp.id),
+                                      child: const Text('Add Pattern'),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    OutlinedButton(
+                                      onPressed:
+                                          _sarPatternByWp.containsKey(wp.id)
+                                          ? () => _clearSarFor(wp.id)
+                                          : null,
+                                      child: const Text('Clear'),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              // SAR parameter fields
+                              Builder(
+                                builder: (_) {
+                                  final typ =
+                                      _patternTypeByWp[wp.id] ??
+                                      SarPatternType.parallel;
+                                  final params = _ensureSarParams(wp.id, typ);
+                                  // default route heading (optional quick fill)
+                                  final oLat = _parseCoord(
+                                    originLatController.text,
+                                    isLat: true,
+                                  );
+                                  final oLon = _parseCoord(
+                                    originLonController.text,
+                                    isLat: false,
+                                  );
+                                  final dLat = _parseCoord(
+                                    destLatController.text,
+                                    isLat: true,
+                                  );
+                                  final dLon = _parseCoord(
+                                    destLonController.text,
+                                    isLat: false,
+                                  );
+                                  final rteHdg =
+                                      (oLat.isFinite &&
+                                          oLon.isFinite &&
+                                          dLat.isFinite &&
+                                          dLon.isFinite)
+                                      ? _initialBearingDeg(
+                                          oLat,
+                                          oLon,
+                                          dLat,
+                                          dLon,
+                                        )
+                                      : 0.0;
+
+                                  return Padding(
+                                    padding: const EdgeInsets.only(top: 8.0),
+                                    child: Wrap(
+                                      spacing: 8,
+                                      runSpacing: 8,
+                                      crossAxisAlignment:
+                                          WrapCrossAlignment.center,
+                                      children: [
+                                        // Heading shown for all types (persistent controller)
+                                        Builder(
+                                          builder: (_) {
+                                            final headingCtrl = _sarHeadingCtrls
+                                                .putIfAbsent(
+                                                  wp.id,
+                                                  () => TextEditingController(
+                                                    text:
+                                                        params
+                                                            .headingDeg
+                                                            .isFinite
+                                                        ? params.headingDeg
+                                                              .toStringAsFixed(
+                                                                0,
+                                                              )
+                                                        : '',
+                                                  ),
+                                                );
+                                            return SizedBox(
+                                              width: 100,
+                                              child: TextField(
+                                                controller: headingCtrl,
+                                                keyboardType:
+                                                    TextInputType.number,
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                ),
+                                                decoration:
+                                                    const InputDecoration(
+                                                      labelText: 'Heading°',
+                                                      isDense: true,
+                                                      border:
+                                                          OutlineInputBorder(),
+                                                    ),
+                                                onChanged: (s) {
+                                                  final v = _parseNumber(s);
+                                                  setState(() {
+                                                    params.headingDeg =
+                                                        _normHdg(v);
+                                                    _sarParamsByWp[wp.id] =
+                                                        params;
+                                                  });
+                                                },
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                        TextButton(
+                                          onPressed: () => setState(() {
+                                            params.headingDeg = _normHdg(
+                                              rteHdg,
+                                            );
+                                            _sarParamsByWp[wp.id] = params;
+                                            _sarHeadingCtrls[wp.id]?.text =
+                                                params.headingDeg
+                                                    .toStringAsFixed(0);
+                                          }),
+                                          child: const Text('Use Route'),
+                                        ),
+                                        if (typ == SarPatternType.parallel) ...[
+                                          _sarNumberField(
+                                            label: 'Leg NM',
+                                            value: params.legNm,
+                                            onChanged: (v) => setState(() {
+                                              params.legNm = v;
+                                              _sarParamsByWp[wp.id] = params;
+                                            }),
+                                          ),
+                                          _sarNumberField(
+                                            label: 'Spacing',
+                                            value: params.spacingNm,
+                                            onChanged: (v) => setState(() {
+                                              params.spacingNm = v;
+                                              _sarParamsByWp[wp.id] = params;
+                                            }),
+                                          ),
+                                          _sarIntField(
+                                            label: 'Legs',
+                                            value: params.legs,
+                                            onChanged: (v) => setState(() {
+                                              params.legs = v;
+                                              _sarParamsByWp[wp.id] = params;
+                                            }),
+                                          ),
+                                        ] else if (typ ==
+                                            SarPatternType.expandingSquare) ...[
+                                          _sarNumberField(
+                                            label: 'Step NM',
+                                            value: params.stepNm,
+                                            onChanged: (v) => setState(() {
+                                              params.stepNm = v;
+                                              _sarParamsByWp[wp.id] = params;
+                                            }),
+                                          ),
+                                          _sarIntField(
+                                            label: 'Layers',
+                                            value: params.layers,
+                                            onChanged: (v) => setState(() {
+                                              params.layers = v;
+                                              _sarParamsByWp[wp.id] = params;
+                                            }),
+                                          ),
+                                        ] else if (typ ==
+                                            SarPatternType.sector) ...[
+                                          _sarNumberField(
+                                            label: 'Radius NM',
+                                            value: params.radiusNm,
+                                            onChanged: (v) => setState(() {
+                                              params.radiusNm = v;
+                                              _sarParamsByWp[wp.id] = params;
+                                            }),
+                                          ),
+                                          _sarIntField(
+                                            label: 'Sectors',
+                                            value: params.sectors,
+                                            onChanged: (v) => setState(() {
+                                              params.sectors = v;
+                                              _sarParamsByWp[wp.id] = params;
+                                            }),
+                                          ),
+                                        ],
+                                        // Regenerate with current params
+                                        OutlinedButton.icon(
+                                          onPressed: () =>
+                                              _generateSarFor(wp.id),
+                                          icon: const Icon(Icons.refresh),
+                                          label: const Text('Regenerate'),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
                               ),
                             ],
                           )
@@ -1669,6 +2648,259 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     );
   }
 
+  double _sarDistanceOneWayNm() {
+    double sum = 0.0;
+    _sarPatternByWp.forEach((wpId, pts) {
+      // Only count patterns for enabled waypoints
+      final enabled = _waypoints.any((w) => w.id == wpId && w.enabled);
+      if (!enabled || pts.length < 2) return;
+      for (int i = 0; i + 1 < pts.length; i++) {
+        sum += _gcDistanceNm(
+          pts[i].latitude,
+          pts[i].longitude,
+          pts[i + 1].latitude,
+          pts[i + 1].longitude,
+        );
+      }
+    });
+    return sum;
+  }
+
+  // Serialize current plan (origin/dest, waypoints, SAR params + generated points)
+  Map<String, dynamic> _buildPlanJson() {
+    double? dec(String s, {required bool isLat}) {
+      final v = _parseCoord(s, isLat: isLat);
+      return v.isFinite ? v : null;
+    }
+
+    SarPatternType typeFor(String id) =>
+        _patternTypeByWp[id] ?? SarPatternType.parallel;
+
+    Map<String, dynamic> paramsToJson(SarParams p) => {
+      'headingDeg': p.headingDeg,
+      'legNm': p.legNm,
+      'spacingNm': p.spacingNm,
+      'legs': p.legs,
+      'stepNm': p.stepNm,
+      'layers': p.layers,
+      'radiusNm': p.radiusNm,
+      'sectors': p.sectors,
+    };
+
+    List<List<double>> ptsToJson(List<LatLng> pts) =>
+        pts.map((p) => [p.latitude, p.longitude]).toList();
+
+    final order = _waypoints.map((w) => w.id).toList();
+    final wps = _waypoints
+        .map(
+          (w) => {
+            'id': w.id,
+            'title': w.title,
+            'enabled': w.enabled,
+            'lat': dec(w.lat.text, isLat: true),
+            'lon': dec(w.lon.text, isLat: false),
+            'patternType': typeFor(w.id).name,
+            'params': paramsToJson(
+              _ensureSarParams(w.id, typeFor(w.id)),
+            ), // <-- close paramsToJson(...)
+            if (_sarPatternByWp[w.id] != null)
+              'generatedPoints': ptsToJson(_sarPatternByWp[w.id]!),
+          },
+        )
+        .toList();
+
+    return {
+      'version': 1,
+      'createdAt': DateTime.now().toIso8601String(),
+      'includeSarInPnr': includeSarInPnr,
+      'showSarLabels': showSarLabels,
+      'origin': {
+        'lat': dec(originLatController.text, isLat: true),
+        'lon': dec(originLonController.text, isLat: false),
+      },
+      'destination': {
+        'lat': dec(destLatController.text, isLat: true),
+        'lon': dec(destLonController.text, isLat: false),
+      },
+      'waypointOrder': order,
+      'waypoints': wps,
+    };
+  }
+
+  SarPatternType _typeFromName(String? name) {
+    switch (name) {
+      case 'parallel':
+        return SarPatternType.parallel;
+      case 'expandingSquare':
+        return SarPatternType.expandingSquare;
+      case 'sector':
+        return SarPatternType.sector;
+      default:
+        return SarPatternType.parallel;
+    }
+  }
+
+  SarParams _paramsFromJson(Map<String, dynamic>? m) {
+    if (m == null) return SarParams.defaultsFor(SarPatternType.parallel);
+    double d(dynamic v) => _numToDouble(v);
+    int i(dynamic v) => (v is int) ? v : d(v).round();
+    return SarParams(
+      headingDeg: d(m['headingDeg']),
+      legNm: d(m['legNm']),
+      spacingNm: d(m['spacingNm']),
+      legs: i(m['legs']),
+      stepNm: d(m['stepNm']),
+      layers: i(m['layers']),
+      radiusNm: d(m['radiusNm']),
+      sectors: i(m['sectors']),
+    );
+  }
+
+  Future<void> savePlanJson() async {
+    final jsonMap = _buildPlanJson();
+    final pretty = const JsonEncoder.withIndent('  ').convert(jsonMap);
+    final saveLocation = await getSaveLocation(
+      suggestedName: 'mission_plan.json',
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'JSON', extensions: ['json']),
+      ],
+    );
+    if (saveLocation == null) {
+      await Clipboard.setData(ClipboardData(text: pretty));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Plan JSON copied to clipboard')),
+        );
+      }
+      return;
+    }
+    final data = Uint8List.fromList(utf8.encode(pretty));
+    final xfile = XFile.fromData(
+      data,
+      name: 'mission_plan.json',
+      mimeType: 'application/json',
+    );
+    await xfile.saveTo(saveLocation.path);
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Saved: ${saveLocation.path}')));
+    }
+  }
+
+  Future<void> loadPlanJson() async {
+    final file = await openFile(
+      acceptedTypeGroups: const [
+        XTypeGroup(label: 'JSON', extensions: ['json']),
+      ],
+    );
+    if (file == null) return;
+    final bytes = await file.readAsBytes();
+    final text = utf8.decode(bytes);
+    final obj = jsonDecode(text) as Map<String, dynamic>;
+    _applyPlanJson(obj);
+  }
+
+  void _applyPlanJson(Map<String, dynamic> j) {
+    double? d(dynamic v) {
+      if (v == null) return null;
+      if (v is num) return v.toDouble();
+      return double.tryParse(v.toString());
+    }
+
+    List<LatLng> ptsFromJson(List<dynamic>? arr) {
+      if (arr == null) return const <LatLng>[];
+      return arr
+          .whereType<List>()
+          .where((p) => p.length >= 2)
+          .map((p) => LatLng(d(p[0]) ?? double.nan, d(p[1]) ?? double.nan))
+          .where((p) => p.latitude.isFinite && p.longitude.isFinite)
+          .toList();
+    }
+
+    setState(() {
+      includeSarInPnr = (j['includeSarInPnr'] ?? includeSarInPnr) == true;
+      showSarLabels = (j['showSarLabels'] ?? showSarLabels) == true;
+
+      final o = j['origin'] as Map<String, dynamic>?;
+      final de = j['destination'] as Map<String, dynamic>?;
+      final oLat = d(o?['lat']), oLon = d(o?['lon']);
+      final dLatV = d(de?['lat']), dLonV = d(de?['lon']);
+      if (oLat != null && oLon != null) {
+        originLatController.text = oLat.toStringAsFixed(6);
+        originLonController.text = oLon.toStringAsFixed(6);
+      }
+      if (dLatV != null && dLonV != null) {
+        destLatController.text = dLatV.toStringAsFixed(6);
+        destLonController.text = dLonV.toStringAsFixed(6);
+      }
+
+      // Reorder waypoints by saved order
+      final order = (j['waypointOrder'] as List?)?.whereType<String>().toList();
+      if (order != null && order.isNotEmpty) {
+        final map = {for (final w in _waypoints) w.id: w};
+        final newList = <WaypointItem>[];
+        for (final id in order) {
+          final w = map[id];
+          if (w != null) newList.add(w);
+        }
+        // include any missing (fallback)
+        for (final w in _waypoints) {
+          if (!newList.contains(w)) newList.add(w);
+        }
+        _waypoints = newList;
+      }
+
+      // Reset SAR stores
+      _sarPatternByWp.clear();
+      _patternTypeByWp.clear();
+      _sarParamsByWp.clear();
+
+      final wps = (j['waypoints'] as List?)?.whereType<Map>().toList() ?? [];
+      for (final m in wps) {
+        final id = m['id']?.toString() ?? '';
+        final wp = _waypoints.firstWhere(
+          (w) => w.id == id,
+          orElse: () => _waypoints.first,
+        );
+        wp.enabled = (m['enabled'] == true);
+        final lat = d(m['lat']), lon = d(m['lon']);
+        if (lat != null && lon != null) {
+          wp.lat.text = lat.toStringAsFixed(6);
+          wp.lon.text = lon.toStringAsFixed(6);
+        }
+        final type = _typeFromName(m['patternType']?.toString());
+        _patternTypeByWp[id] = type;
+        final params = _paramsFromJson(m['params'] as Map<String, dynamic>?);
+        _sarParamsByWp[id] = params;
+
+        final pts = ptsFromJson(m['generatedPoints'] as List<dynamic>?);
+        if (pts.isNotEmpty) {
+          _sarPatternByWp[id] = pts;
+        } else if (wp.enabled) {
+          // regenerate if no stored geometry
+          _generateSarFor(id);
+        }
+      }
+
+      _syncWaypointFlagsFromList();
+    });
+
+    _validateAndDistance();
+  }
+
+  // Build ARGB color map for KML SAR styles
+  Map<String, int> _sarArgbMap() {
+    final m = <String, int>{};
+    for (final id in _sarPatternByWp.keys) {
+      final c = _sarColorFor(id);
+      m[id] = c.toARGB32(); // ARGB 0xAARRGGBB
+    }
+    return m;
+  }
+
+  // ...existing code...
+
   // ---------- UI ----------
   // NEW: helper to manually apply AI suggestions when autoApplyAi = false
   void applyAiSuggestions() {
@@ -1684,10 +2916,72 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     });
   }
 
+  Widget _buildSettingsDialog() {
+    return AlertDialog(
+      title: const Text('Settings'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SwitchListTile(
+            title: const Text('Auto-center map on aircraft'),
+            value: _autoCenterEnabled,
+            onChanged: (v) {
+              setState(() => _autoCenterEnabled = v);
+              Navigator.of(context).pop();
+            },
+          ),
+          SwitchListTile(
+            title: const Text('Heading Up (Map rotates with aircraft)'),
+            value: _headingUp,
+            onChanged: (v) {
+              setState(() => _headingUp = v);
+              Navigator.of(context).pop();
+            },
+          ),
+          SwitchListTile(
+            title: const Text('Simulate Aircraft (desktop/web)'),
+            value: _simulateAircraft,
+            onChanged: (v) {
+              setState(() => _simulateAircraft = v);
+              if (v) {
+                _startSimulation();
+              } else {
+                _stopSimulation();
+                _startGpsTracking();
+              }
+              Navigator.of(context).pop();
+            },
+          ),
+          // Add more toggles here as you add features!
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('AW139 Cruise Planner v4')),
+      appBar: AppBar(
+        title: const Text('AW139 Cruise Planner v4'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Settings',
+            onPressed: () {
+              showDialog(
+                context: context,
+                builder: (context) => _buildSettingsDialog(),
+              );
+            },
+          ),
+        ],
+      ),
       body: LayoutBuilder(
         builder: (context, constraints) {
           final wide = constraints.maxWidth >= 900;
@@ -1723,7 +3017,17 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                               .toList(),
                           onChanged: (v) {
                             if (v == null) return;
-                            setState(() => _selectedAircraft = v);
+                            setState(() {
+                              _selectedAircraft = v;
+                              // Set reserve fuel default for selected aircraft
+                              if (_selectedAircraft == 'Bell 412') {
+                                reserveController.text = '390';
+                                reserveFuel = 390;
+                              } else {
+                                reserveController.text = '184';
+                                reserveFuel = 184;
+                              }
+                            });
                           },
                         ),
                       ],
@@ -1744,12 +3048,42 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     readOnly: useWindsAloft && autoApplyAi,
                   ),
                   buildInputField('Temperature (°C)', temperatureController),
+
                   buildInputField(
                     "Fuel Onboard (${_selectedAircraft == 'Bell 412' ? 'lbs' : 'kg'})",
                     fuelController,
                   ),
+                  buildInputField(
+                    "Reserve Fuel (${_selectedAircraft == 'Bell 412' ? 'lbs' : 'kg'})",
+                    reserveController,
+                  ),
                   buildInputField('Hoist Time (min)', hoistTimeController),
-
+                  const SizedBox(height: 16),
+                  coordField(
+                    'Origin Latitude',
+                    originLatController,
+                    isLat: true,
+                    errorText: originLatError,
+                  ),
+                  coordField(
+                    'Origin Longitude',
+                    originLonController,
+                    isLat: false,
+                    errorText: originLonError,
+                  ),
+                  coordField(
+                    'Destination Latitude',
+                    destLatController,
+                    isLat: true,
+                    errorText: destLatError,
+                  ),
+                  coordField(
+                    'Destination Longitude',
+                    destLonController,
+                    isLat: false,
+                    errorText: destLonError,
+                  ),
+                  buildWaypointPlanner(),
                   // --- 4 toggles placed here ---
                   SwitchListTile(
                     title: const Text('Use device location for Origin'),
@@ -1789,6 +3123,56 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         }
                       });
                     },
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Auto-center map on aircraft'),
+                    value: _autoCenterEnabled,
+                    onChanged: (v) => setState(() => _autoCenterEnabled = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Simulate Aircraft (desktop/web)'),
+                    value: _simulateAircraft,
+                    onChanged: (v) {
+                      setState(() => _simulateAircraft = v);
+                      if (v) {
+                        _startSimulation();
+                      } else {
+                        _stopSimulation();
+                        _startGpsTracking();
+                      }
+                    },
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Auto-center map on aircraft'),
+                    value: _autoCenterEnabled,
+                    onChanged: (v) => setState(() => _autoCenterEnabled = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Heading Up (Map rotates with aircraft)'),
+                    value: _headingUp,
+                    onChanged: (v) => setState(() => _headingUp = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Show Mission Map & Weather'),
+                    value: showMap,
+                    onChanged: (v) => setState(() => showMap = v),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  SwitchListTile(
+                    title: const Text('Create waypoint from radial/distance'),
+                    value: showNavTool,
+                    onChanged: (v) => setState(() => showNavTool = v),
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
@@ -1922,14 +3306,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         ],
                       ),
                     ),
+
                   // ...after the AI objective selector (and optional slider)...
-                  SwitchListTile(
-                    title: const Text('Show Mission Map & Weather'),
-                    value: showMap,
-                    onChanged: (v) => setState(() => showMap = v),
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
                   if (showMap)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 8.0),
@@ -1937,558 +3315,998 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                         icon: const Icon(Icons.map),
                         label: const Text('View Mission Map'),
                         onPressed: () {
-                          showDialog(
+                          showDialog<void>(
                             context: context,
-                            builder: (_) => Dialog(
-                              child: SizedBox(
-                                width: 900,
-                                height: 640,
-                                child: FlutterMap(
-                                  options: MapOptions(
-                                    initialCenter: LatLng(
-                                      _parseCoord(
+                            builder: (dialogContext) {
+                              // --- MapWidget (build once, outside widget tree) ---
+                              Widget mapWidget = FlutterMap(
+                                mapController: _mapController,
+                                options: MapOptions(
+                                  initialCenter: _safeMapCenter(),
+                                  initialZoom: 8,
+                                  onTap: (tapPos, latlng) {
+                                    final latDms = _formatDms(
+                                      latlng.latitude,
+                                      isLat: true,
+                                    );
+                                    final lonDms = _formatDms(
+                                      latlng.longitude,
+                                      isLat: false,
+                                    );
+                                    setState(() {
+                                      switch (_mapEditTarget) {
+                                        case 'origin':
+                                          originLatController.text = latDms;
+                                          originLonController.text = lonDms;
+                                          break;
+                                        case 'dest':
+                                          destLatController.text = latDms;
+                                          destLonController.text = lonDms;
+                                          break;
+                                        case 'hospital':
+                                          hospitalLatController.text = latDms;
+                                          hospitalLonController.text = lonDms;
+                                          for (final wp in _waypoints) {
+                                            if (wp.id == 'hospital') {
+                                              wp.enabled = true;
+                                            }
+                                          }
+                                          useHospitalWaypoint = true;
+                                          break;
+                                        case 'wpt1':
+                                          waypoint1LatController.text = latDms;
+                                          waypoint1LonController.text = lonDms;
+                                          for (final wp in _waypoints) {
+                                            if (wp.id == 'wpt1') {
+                                              wp.enabled = true;
+                                            }
+                                          }
+                                          useWaypoint1 = true;
+                                          break;
+                                        case 'wpt2':
+                                          waypoint2LatController.text = latDms;
+                                          waypoint2LonController.text = lonDms;
+                                          for (final wp in _waypoints) {
+                                            if (wp.id == 'wpt2') {
+                                              wp.enabled = true;
+                                            }
+                                          }
+                                          useWaypoint2 = true;
+                                          break;
+                                      }
+                                      _validateAndDistance();
+                                    });
+                                  },
+                                ),
+                                children: [
+                                  TileLayer(
+                                    urlTemplate:
+                                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                                    userAgentPackageName:
+                                        'com.example.aw139_cruise',
+                                  ),
+                                  Opacity(
+                                    opacity: 0.7,
+                                    child: TileLayer(
+                                      urlTemplate:
+                                          'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
+                                    ),
+                                  ),
+                                  Opacity(
+                                    opacity: 0.6,
+                                    child: TileLayer(
+                                      urlTemplate:
+                                          'https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
+                                    ),
+                                  ),
+                                  Opacity(
+                                    opacity: 0.8,
+                                    child: TileLayer(
+                                      urlTemplate:
+                                          'https://tile.openweathermap.org/map/wind_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
+                                    ),
+                                  ),
+                                  // SAR polylines per waypoint (colored)
+                                  PolylineLayer(
+                                    polylines: _buildSarPolylines(),
+                                  ),
+                                  // Main route polyline (with SAR pattern expansion)
+                                  PolylineLayer(
+                                    polylines: [
+                                      Polyline(
+                                        points: () {
+                                          final pts = <LatLng>[];
+                                          final oLat = _parseCoord(
+                                            originLatController.text,
+                                            isLat: true,
+                                          );
+                                          final oLon = _parseCoord(
+                                            originLonController.text,
+                                            isLat: false,
+                                          );
+                                          final dLat = _parseCoord(
+                                            destLatController.text,
+                                            isLat: true,
+                                          );
+                                          final dLon = _parseCoord(
+                                            destLonController.text,
+                                            isLat: false,
+                                          );
+                                          if (oLat.isFinite && oLon.isFinite) {
+                                            pts.add(LatLng(oLat, oLon));
+                                          }
+                                          for (final wp in _waypoints) {
+                                            if (!wp.enabled) continue;
+                                            final wLat = _parseCoord(
+                                              wp.lat.text,
+                                              isLat: true,
+                                            );
+                                            final wLon = _parseCoord(
+                                              wp.lon.text,
+                                              isLat: false,
+                                            );
+                                            if (wLat.isFinite &&
+                                                wLon.isFinite) {
+                                              final anchor = LatLng(wLat, wLon);
+                                              pts.add(anchor);
+                                              _appendPatternIfAny(
+                                                pts,
+                                                wp.id,
+                                                anchor,
+                                              );
+                                            }
+                                          }
+                                          if (dLat.isFinite && dLon.isFinite) {
+                                            pts.add(LatLng(dLat, dLon));
+                                          }
+                                          return pts;
+                                        }(),
+                                        color: Colors.blue,
+                                        strokeWidth: 4,
+                                      ),
+                                    ],
+                                  ),
+                                  // SAR arrows
+                                  MarkerLayer(markers: _sarArrowMarkers()),
+                                  // SAR labels
+                                  MarkerLayer(
+                                    markers: showSarLabels
+                                        ? _buildSarLabelMarkers()
+                                        : const <Marker>[],
+                                  ),
+                                  // Origin/waypoints/destination pins
+                                  MarkerLayer(
+                                    markers: () {
+                                      final ms = <Marker>[];
+                                      final oLat = _parseCoord(
                                         originLatController.text,
                                         isLat: true,
-                                      ),
-                                      _parseCoord(
+                                      );
+                                      final oLon = _parseCoord(
                                         originLonController.text,
                                         isLat: false,
-                                      ),
-                                    ),
-                                    initialZoom: 8,
+                                      );
+                                      final dLat = _parseCoord(
+                                        destLatController.text,
+                                        isLat: true,
+                                      );
+                                      final dLon = _parseCoord(
+                                        destLonController.text,
+                                        isLat: false,
+                                      );
+                                      if (oLat.isFinite && oLon.isFinite) {
+                                        ms.add(
+                                          Marker(
+                                            point: LatLng(oLat, oLon),
+                                            width: 30,
+                                            height: 30,
+                                            child: const Icon(
+                                              Icons.location_on,
+                                              color: Colors.green,
+                                            ),
+                                          ),
+                                        );
+                                      }
+                                      for (final wp in _waypoints) {
+                                        if (!wp.enabled) continue;
+                                        final wLat = _parseCoord(
+                                          wp.lat.text,
+                                          isLat: true,
+                                        );
+                                        final wLon = _parseCoord(
+                                          wp.lon.text,
+                                          isLat: false,
+                                        );
+                                        if (!wLat.isFinite || !wLon.isFinite) {
+                                          continue;
+                                        }
+                                        ms.add(
+                                          Marker(
+                                            point: LatLng(wLat, wLon),
+                                            width: 28,
+                                            height: 28,
+                                            child: wp.id == 'hospital'
+                                                ? const Icon(
+                                                    Icons.local_hospital,
+                                                    color: Colors.pink,
+                                                  )
+                                                : const Icon(
+                                                    Icons.location_searching,
+                                                    color: Colors.cyan,
+                                                  ),
+                                          ),
+                                        );
+                                      }
+                                      if (dLat.isFinite && dLon.isFinite) {
+                                        ms.add(
+                                          Marker(
+                                            point: LatLng(dLat, dLon),
+                                            width: 30,
+                                            height: 30,
+                                            child: const Icon(
+                                              Icons.flag,
+                                              color: Colors.red,
+                                            ),
+                                          ),
+                                        );
+                                      }
+                                      return ms;
+                                    }(),
                                   ),
-                                  children: <Widget>[
-                                    TileLayer(
-                                      urlTemplate:
-                                          'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                                      subdomains: const ['a', 'b', 'c'],
-                                    ),
-                                    Opacity(
-                                      opacity: 0.7,
-                                      child: TileLayer(
-                                        urlTemplate:
-                                            'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
-                                      ),
-                                    ),
-                                    Opacity(
-                                      opacity: 0.8,
-                                      child: TileLayer(
-                                        urlTemplate:
-                                            'https://tile.openweathermap.org/map/wind_new/{z}/{x}/{y}.png?appid=$kOpenWeatherApiKey',
-                                      ),
-                                    ),
-                                    // Route polyline (origin -> enabled waypoints -> destination)
-                                    PolylineLayer(
-                                      polylines: [
-                                        Polyline(
-                                          points: () {
-                                            final pts = <LatLng>[];
-                                            final oLat = _parseCoord(
-                                              originLatController.text,
-                                              isLat: true,
-                                            );
-                                            final oLon = _parseCoord(
-                                              originLonController.text,
-                                              isLat: false,
-                                            );
-                                            final dLat = _parseCoord(
-                                              destLatController.text,
-                                              isLat: true,
-                                            );
-                                            final dLon = _parseCoord(
-                                              destLonController.text,
-                                              isLat: false,
-                                            );
-                                            if (oLat.isFinite &&
-                                                oLon.isFinite) {
-                                              pts.add(LatLng(oLat, oLon));
-                                            }
-                                            for (final wp in _waypoints) {
-                                              if (!wp.enabled) continue;
-                                              final wLat = _parseCoord(
-                                                wp.lat.text,
-                                                isLat: true,
-                                              );
-                                              final wLon = _parseCoord(
-                                                wp.lon.text,
-                                                isLat: false,
-                                              );
-                                              if (wLat.isFinite &&
-                                                  wLon.isFinite) {
-                                                pts.add(LatLng(wLat, wLon));
-                                              }
-                                            }
-                                            if (dLat.isFinite &&
-                                                dLon.isFinite) {
-                                              pts.add(LatLng(dLat, dLon));
-                                            }
-                                            return pts;
-                                          }(),
-                                          color: Colors.blue,
-                                          strokeWidth: 4,
+                                  // Wind arrows at origin/dest
+                                  MarkerLayer(
+                                    markers: () {
+                                      final ms = <Marker>[];
+                                      final oLat = _parseCoord(
+                                        originLatController.text,
+                                        isLat: true,
+                                      );
+                                      final oLon = _parseCoord(
+                                        originLonController.text,
+                                        isLat: false,
+                                      );
+                                      final dLat = _parseCoord(
+                                        destLatController.text,
+                                        isLat: true,
+                                      );
+                                      final dLon = _parseCoord(
+                                        destLonController.text,
+                                        isLat: false,
+                                      );
+                                      if (oLat.isFinite && oLon.isFinite) {
+                                        ms.addAll(
+                                          _buildWindArrowMarkers(
+                                            'origin',
+                                            oLat,
+                                            oLon,
+                                            alt: altitude,
+                                          ),
+                                        );
+                                      }
+                                      if (dLat.isFinite && dLon.isFinite) {
+                                        ms.addAll(
+                                          _buildWindArrowMarkers(
+                                            'dest',
+                                            dLat,
+                                            dLon,
+                                            alt: altitude,
+                                          ),
+                                        );
+                                      }
+                                      return ms;
+                                    }(),
+                                  ),
+                                  // PNR pin
+                                  MarkerLayer(markers: _buildPnrMarkers()),
+                                  // Aircraft icon (live or simulated)
+                                  MarkerLayer(
+                                    markers: [
+                                      if (_aircraftPosition != null)
+                                        Marker(
+                                          point:
+                                              _aircraftAnimFrom != null &&
+                                                  _aircraftAnimTo != null
+                                              ? LatLng(
+                                                  _aircraftAnimFrom!.latitude +
+                                                      (_aircraftAnimTo!
+                                                                  .latitude -
+                                                              _aircraftAnimFrom!
+                                                                  .latitude) *
+                                                          _aircraftAnimT,
+                                                  _aircraftAnimFrom!.longitude +
+                                                      (_aircraftAnimTo!
+                                                                  .longitude -
+                                                              _aircraftAnimFrom!
+                                                                  .longitude) *
+                                                          _aircraftAnimT,
+                                                )
+                                              : _aircraftPosition!,
+                                          width: 40,
+                                          height: 40,
+                                          child: Transform.rotate(
+                                            angle: _degToRad(_aircraftHeading),
+                                            child: const Icon(
+                                              Icons.airplanemode_active,
+                                              color: Colors.amber,
+                                              size: 36,
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ],
+                              );
+                              if (_headingUp && _aircraftHeading.isFinite) {
+                                mapWidget = Transform.rotate(
+                                  angle: -_degToRad(_aircraftHeading),
+                                  child: mapWidget,
+                                );
+                              }
+
+                              return Dialog(
+                                insetPadding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 12,
+                                ),
+                                child: SizedBox(
+                                  width: 900,
+                                  height: 640,
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(12),
+                                    child: Column(
+                                      children: [
+                                        // Edit bar
+                                        Container(
+                                          color: kPanelColor,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 12,
+                                            vertical: 8,
+                                          ),
+                                          child: Row(
+                                            children: [
+                                              const Text(
+                                                'Edit target:',
+                                                style: TextStyle(
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                              const SizedBox(width: 8),
+                                              DropdownButton<String>(
+                                                value: _mapEditTarget,
+                                                dropdownColor: kPanelColor,
+                                                items: const [
+                                                  DropdownMenuItem(
+                                                    value: 'origin',
+                                                    child: Text(
+                                                      'Origin',
+                                                      style: TextStyle(
+                                                        color: Colors.white,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  DropdownMenuItem(
+                                                    value: 'hospital',
+                                                    child: Text(
+                                                      'Hospital',
+                                                      style: TextStyle(
+                                                        color: Colors.white,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  DropdownMenuItem(
+                                                    value: 'wpt1',
+                                                    child: Text(
+                                                      'Waypoint 1',
+                                                      style: TextStyle(
+                                                        color: Colors.white,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  DropdownMenuItem(
+                                                    value: 'wpt2',
+                                                    child: Text(
+                                                      'Waypoint 2',
+                                                      style: TextStyle(
+                                                        color: Colors.white,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  DropdownMenuItem(
+                                                    value: 'dest',
+                                                    child: Text(
+                                                      'Destination',
+                                                      style: TextStyle(
+                                                        color: Colors.white,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                                onChanged: (v) => setState(
+                                                  () => _mapEditTarget =
+                                                      v ?? 'wpt1',
+                                                ),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              const Text(
+                                                'Tip: Tap map to place/move selection',
+                                                style: TextStyle(
+                                                  color: Colors.white70,
+                                                ),
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Checkbox(
+                                                    value: showSarLabels,
+                                                    onChanged: (v) => setState(
+                                                      () => showSarLabels =
+                                                          v ?? true,
+                                                    ),
+                                                    materialTapTargetSize:
+                                                        MaterialTapTargetSize
+                                                            .shrinkWrap,
+                                                  ),
+                                                  const Text(
+                                                    'Labels',
+                                                    style: TextStyle(
+                                                      color: Colors.white,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 12),
+                                                  Checkbox(
+                                                    value: includeSarInPnr,
+                                                    onChanged: (v) => setState(
+                                                      () => includeSarInPnr =
+                                                          v ?? true,
+                                                    ),
+                                                    materialTapTargetSize:
+                                                        MaterialTapTargetSize
+                                                            .shrinkWrap,
+                                                  ),
+                                                  const Text(
+                                                    'PNR includes SAR',
+                                                    style: TextStyle(
+                                                      color: Colors.white,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              const Spacer(),
+                                              TextButton(
+                                                onPressed: () => Navigator.of(
+                                                  dialogContext,
+                                                ).pop(),
+                                                child: const Text('Close'),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+
+                                        // Map + overlays
+                                        Expanded(
+                                          child: Stack(
+                                            children: [
+                                              mapWidget,
+
+                                              // SAR legend (top-right)
+                                              Positioned(
+                                                right: 8,
+                                                top: 8,
+                                                child: Builder(
+                                                  builder: (_) {
+                                                    if (_sarPatternByWp
+                                                        .isEmpty) {
+                                                      return const SizedBox.shrink();
+                                                    }
+                                                    final ids = _sarPatternByWp
+                                                        .keys
+                                                        .toList();
+                                                    return Container(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 10,
+                                                            vertical: 6,
+                                                          ),
+                                                      decoration: BoxDecoration(
+                                                        color: Colors.black54,
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              8,
+                                                            ),
+                                                      ),
+                                                      child: Wrap(
+                                                        spacing: 10,
+                                                        runSpacing: 6,
+                                                        children: ids.map((id) {
+                                                          return Row(
+                                                            mainAxisSize:
+                                                                MainAxisSize
+                                                                    .min,
+                                                            children: [
+                                                              Container(
+                                                                width: 10,
+                                                                height: 10,
+                                                                decoration: BoxDecoration(
+                                                                  color:
+                                                                      _sarColorFor(
+                                                                        id,
+                                                                      ),
+                                                                  shape: BoxShape
+                                                                      .circle,
+                                                                ),
+                                                              ),
+                                                              const SizedBox(
+                                                                width: 6,
+                                                              ),
+                                                              Text(
+                                                                id.toUpperCase(),
+                                                                style: const TextStyle(
+                                                                  color: Colors
+                                                                      .white,
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          );
+                                                        }).toList(),
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              ),
+
+                                              // Live total distance + track overlay
+                                              Positioned(
+                                                left: 8,
+                                                bottom: 8,
+                                                child: Builder(
+                                                  builder: (_) {
+                                                    final pts = <LatLng>[];
+                                                    final oLat = _parseCoord(
+                                                      originLatController.text,
+                                                      isLat: true,
+                                                    );
+                                                    final oLon = _parseCoord(
+                                                      originLonController.text,
+                                                      isLat: false,
+                                                    );
+                                                    final dLat = _parseCoord(
+                                                      destLatController.text,
+                                                      isLat: true,
+                                                    );
+                                                    final dLon = _parseCoord(
+                                                      destLonController.text,
+                                                      isLat: false,
+                                                    );
+                                                    if (oLat.isFinite &&
+                                                        oLon.isFinite) {
+                                                      pts.add(
+                                                        LatLng(oLat, oLon),
+                                                      );
+                                                    }
+                                                    for (final wp
+                                                        in _waypoints) {
+                                                      if (!wp.enabled) continue;
+                                                      final wLat = _parseCoord(
+                                                        wp.lat.text,
+                                                        isLat: true,
+                                                      );
+                                                      final wLon = _parseCoord(
+                                                        wp.lon.text,
+                                                        isLat: false,
+                                                      );
+                                                      if (wLat.isFinite &&
+                                                          wLon.isFinite) {
+                                                        final anchor = LatLng(
+                                                          wLat,
+                                                          wLon,
+                                                        );
+                                                        pts.add(anchor);
+                                                        _appendPatternIfAny(
+                                                          pts,
+                                                          wp.id,
+                                                          anchor,
+                                                        );
+                                                      }
+                                                    }
+                                                    if (dLat.isFinite &&
+                                                        dLon.isFinite) {
+                                                      pts.add(
+                                                        LatLng(dLat, dLon),
+                                                      );
+                                                    }
+                                                    double total = 0.0;
+                                                    if (pts.length >= 2) {
+                                                      for (
+                                                        int i = 0;
+                                                        i < pts.length - 1;
+                                                        i++
+                                                      ) {
+                                                        total += _gcDistanceNm(
+                                                          pts[i].latitude,
+                                                          pts[i].longitude,
+                                                          pts[i + 1].latitude,
+                                                          pts[i + 1].longitude,
+                                                        );
+                                                      }
+                                                    }
+                                                    final track =
+                                                        (pts.length >= 2)
+                                                        ? _initialBearingDeg(
+                                                            pts.first.latitude,
+                                                            pts.first.longitude,
+                                                            pts.last.latitude,
+                                                            pts.last.longitude,
+                                                          ).toStringAsFixed(0)
+                                                        : '--';
+                                                    final pnrVal = _pnrNm;
+                                                    final showPnr =
+                                                        pnrVal != null &&
+                                                        pnrVal > 0;
+                                                    final pnrText = showPnr
+                                                        ? '   PNR: ${pnrVal.toStringAsFixed(0)} NM'
+                                                        : '';
+                                                    return Container(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 10,
+                                                            vertical: 6,
+                                                          ),
+                                                      decoration: BoxDecoration(
+                                                        color: Colors.black54,
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              8,
+                                                            ),
+                                                      ),
+                                                      child: Text(
+                                                        'Route: ${total.toStringAsFixed(0)} NM   Track: $track°$pnrText',
+                                                        style: const TextStyle(
+                                                          color: Colors.white,
+                                                        ),
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              ),
+                                            ],
+                                          ),
                                         ),
                                       ],
                                     ),
-                                    // Route markers
-                                    MarkerLayer(
-                                      markers: () {
-                                        final ms = <Marker>[];
-                                        final oLat = _parseCoord(
-                                          originLatController.text,
-                                          isLat: true,
-                                        );
-                                        final oLon = _parseCoord(
-                                          originLonController.text,
-                                          isLat: false,
-                                        );
-                                        final dLat = _parseCoord(
-                                          destLatController.text,
-                                          isLat: true,
-                                        );
-                                        final dLon = _parseCoord(
-                                          destLonController.text,
-                                          isLat: false,
-                                        );
-                                        if (oLat.isFinite && oLon.isFinite) {
-                                          ms.add(
-                                            Marker(
-                                              point: LatLng(oLat, oLon),
-                                              width: 30,
-                                              height: 30,
-                                              child: const Icon(
-                                                Icons.location_on,
-                                                color: Colors.green,
-                                              ),
-                                            ),
-                                          );
-                                        }
-                                        for (final wp in _waypoints) {
-                                          if (!wp.enabled) continue;
-                                          final wLat = _parseCoord(
-                                            wp.lat.text,
-                                            isLat: true,
-                                          );
-                                          final wLon = _parseCoord(
-                                            wp.lon.text,
-                                            isLat: false,
-                                          );
-                                          if (!wLat.isFinite ||
-                                              !wLon.isFinite) {
-                                            continue;
-                                          }
-                                          ms.add(
-                                            Marker(
-                                              point: LatLng(wLat, wLon),
-                                              width: 28,
-                                              height: 28,
-                                              child: wp.id == 'hospital'
-                                                  ? const Icon(
-                                                      Icons.local_hospital,
-                                                      color: Colors.pink,
-                                                    )
-                                                  : const Icon(
-                                                      Icons.location_searching,
-                                                      color: Colors.cyan,
-                                                    ),
-                                            ),
-                                          );
-                                        }
-                                        if (dLat.isFinite && dLon.isFinite) {
-                                          ms.add(
-                                            Marker(
-                                              point: LatLng(dLat, dLon),
-                                              width: 30,
-                                              height: 30,
-                                              child: const Icon(
-                                                Icons.flag,
-                                                color: Colors.red,
-                                              ),
-                                            ),
-                                          );
-                                        }
-                                        return ms;
-                                      }(),
-                                    ),
-                                    // Wind arrows overlay (origin/dest)
-                                    MarkerLayer(
-                                      markers: () {
-                                        final ms = <Marker>[];
-                                        final oLat = _parseCoord(
-                                          originLatController.text,
-                                          isLat: true,
-                                        );
-                                        final oLon = _parseCoord(
-                                          originLonController.text,
-                                          isLat: false,
-                                        );
-                                        final dLat = _parseCoord(
-                                          destLatController.text,
-                                          isLat: true,
-                                        );
-                                        final dLon = _parseCoord(
-                                          destLonController.text,
-                                          isLat: false,
-                                        );
-                                        if (oLat.isFinite && oLon.isFinite) {
-                                          ms.addAll(
-                                            _buildWindArrowMarkers(
-                                              'origin',
-                                              oLat,
-                                              oLon,
-                                              alt: altitude,
-                                            ),
-                                          );
-                                        }
-                                        if (dLat.isFinite && dLon.isFinite) {
-                                          ms.addAll(
-                                            _buildWindArrowMarkers(
-                                              'dest',
-                                              dLat,
-                                              dLon,
-                                              alt: altitude,
-                                            ),
-                                          );
-                                        }
-                                        return ms;
-                                      }(),
-                                    ),
-                                  ],
+                                  ),
                                 ),
-                              ),
-                            ),
+                              );
+                            },
                           );
                         },
                       ),
                     ),
-                  // ...existing code continues (coord fields)...
-                  // --- End toggles ---
-                  coordField(
-                    'Origin Latitude',
-                    originLatController,
-                    isLat: true,
-                    errorText: originLatError,
-                  ),
-                  coordField(
-                    'Origin Longitude',
-                    originLonController,
-                    isLat: false,
-                    errorText: originLonError,
-                  ),
-                  coordField(
-                    'Destination Latitude',
-                    destLatController,
-                    isLat: true,
-                    errorText: destLatError,
-                  ),
-                  coordField(
-                    'Destination Longitude',
-                    destLonController,
-                    isLat: false,
-                    errorText: destLonError,
-                  ),
-
-                  // Insert planner here:
-                  buildWaypointPlanner(),
-                  const SizedBox(height: 16),
                   // Toggle to open the radial/distance → waypoint tool
-                  SwitchListTile(
-                    title: const Text('Create waypoint from radial/distance'),
-                    value: showNavTool,
-                    onChanged: (v) => setState(() => showNavTool = v),
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  if (showNavTool)
-                    Card(
-                      color: kPanelColor,
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'From known fix + radial/distance',
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.white,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Row(
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Visibility(
+                        visible: showNavTool,
+                        maintainState: true,
+                        child: Card(
+                          color: kPanelColor,
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Expanded(
-                                  child: DropdownButton<int>(
-                                    value: _selectedFixIndex,
-                                    isExpanded: true,
-                                    dropdownColor: kPanelColor,
-                                    items: [
-                                      for (int i = 0; i < kNavFixes.length; i++)
-                                        DropdownMenuItem(
-                                          value: i,
-                                          child: Text(
-                                            kNavFixes[i].name,
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                            ),
-                                          ),
-                                        ),
-                                      const DropdownMenuItem(
-                                        value: -1, // _customBaseIndex
-                                        child: Text(
-                                          'Custom lat/lon…',
-                                          style: TextStyle(color: Colors.white),
-                                        ),
-                                      ),
-                                    ],
-                                    onChanged: (v) => setState(
-                                      () => _selectedFixIndex = v ?? 0,
-                                    ),
+                                const Text(
+                                  'From known fix + radial/distance',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
                                   ),
                                 ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 90,
-                                  child: TextField(
-                                    controller: _navRadialController,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Radial',
-                                      hintText: '0-360',
-                                      isDense: true,
-                                      border: OutlineInputBorder(),
-                                    ),
-                                    style: const TextStyle(color: Colors.white),
-                                    keyboardType: TextInputType.number,
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 120,
-                                  child: TextField(
-                                    controller: _navDistanceController,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Distance (NM)',
-                                      isDense: true,
-                                      border: OutlineInputBorder(),
-                                    ),
-                                    style: const TextStyle(color: Colors.white),
-                                    keyboardType: TextInputType.number,
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                ElevatedButton.icon(
-                                  onPressed: _computeNavFixPoint,
-                                  icon: const Icon(Icons.calculate),
-                                  label: const Text('Compute'),
-                                ),
-                              ],
-                            ),
-                            if (_selectedFixIndex == _customBaseIndex)
-                              Padding(
-                                padding: const EdgeInsets.only(top: 8.0),
-                                child: Row(
+                                const SizedBox(height: 8),
+                                Row(
                                   children: [
                                     Expanded(
+                                      child: DropdownButton<int>(
+                                        value: _selectedFixIndex,
+                                        isExpanded: true,
+                                        dropdownColor: kPanelColor,
+                                        items: [
+                                          for (
+                                            int i = 0;
+                                            i < kNavFixes.length;
+                                            i++
+                                          )
+                                            DropdownMenuItem(
+                                              value: i,
+                                              child: Text(
+                                                kNavFixes[i].name,
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            ),
+                                          const DropdownMenuItem(
+                                            value: -1,
+                                            child: Text(
+                                              'Custom lat/lon…',
+                                              style: TextStyle(
+                                                color: Colors.white,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                        onChanged: (v) => setState(
+                                          () => _selectedFixIndex = v ?? 0,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    SizedBox(
+                                      width: 90,
                                       child: TextField(
-                                        controller: _navBaseLatController,
+                                        controller: _navRadialController,
                                         decoration: const InputDecoration(
-                                          labelText: 'Base Latitude',
-                                          hintText:
-                                              'e.g. 34 52 20 N or 34.8722',
+                                          labelText: 'Radial',
+                                          hintText: '0-360',
                                           isDense: true,
                                           border: OutlineInputBorder(),
                                         ),
                                         style: const TextStyle(
                                           color: Colors.white,
+                                        ),
+                                        keyboardType: TextInputType.number,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    SizedBox(
+                                      width: 120,
+                                      child: TextField(
+                                        controller: _navDistanceController,
+                                        decoration: const InputDecoration(
+                                          labelText: 'Distance (NM)',
+                                          isDense: true,
+                                          border: OutlineInputBorder(),
+                                        ),
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                        ),
+                                        keyboardType: TextInputType.number,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    ElevatedButton.icon(
+                                      onPressed: _computeNavFixPoint,
+                                      icon: const Icon(Icons.calculate),
+                                      label: const Text('Compute'),
+                                    ),
+                                  ],
+                                ),
+                                (_selectedFixIndex == _customBaseIndex)
+                                    ? Padding(
+                                        padding: const EdgeInsets.only(
+                                          top: 8.0,
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            Expanded(
+                                              child: TextField(
+                                                controller:
+                                                    _navBaseLatController,
+                                                decoration: const InputDecoration(
+                                                  labelText: 'Base Latitude',
+                                                  hintText:
+                                                      'e.g. 34 52 20 N or 34.8722',
+                                                  isDense: true,
+                                                  border: OutlineInputBorder(),
+                                                ),
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Expanded(
+                                              child: TextField(
+                                                controller:
+                                                    _navBaseLonController,
+                                                decoration: const InputDecoration(
+                                                  labelText: 'Base Longitude',
+                                                  hintText:
+                                                      'e.g. 033 37 28 E or 33.6244',
+                                                  isDense: true,
+                                                  border: OutlineInputBorder(),
+                                                ),
+                                                style: const TextStyle(
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      )
+                                    : const SizedBox.shrink(),
+                                const SizedBox(height: 8),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: TextField(
+                                        readOnly: true,
+                                        controller: _navOutLatController,
+                                        decoration: const InputDecoration(
+                                          labelText: 'Latitude (DMS)',
+                                          isDense: true,
+                                          border: OutlineInputBorder(),
+                                        ),
+                                        style: const TextStyle(
+                                          color: Colors.white70,
                                         ),
                                       ),
                                     ),
                                     const SizedBox(width: 8),
                                     Expanded(
                                       child: TextField(
-                                        controller: _navBaseLonController,
+                                        readOnly: true,
+                                        controller: _navOutLonController,
                                         decoration: const InputDecoration(
-                                          labelText: 'Base Longitude',
-                                          hintText:
-                                              'e.g. 033 37 28 E or 33.6244',
+                                          labelText: 'Longitude (DMS)',
                                           isDense: true,
                                           border: OutlineInputBorder(),
                                         ),
                                         style: const TextStyle(
-                                          color: Colors.white,
+                                          color: Colors.white70,
                                         ),
                                       ),
                                     ),
                                   ],
                                 ),
-                              ),
-                            const SizedBox(height: 8),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: TextField(
-                                    readOnly: true,
-                                    controller: _navOutLatController,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Latitude (DMS)',
-                                      isDense: true,
-                                      border: OutlineInputBorder(),
+                                const SizedBox(height: 6),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 6,
+                                  children: [
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.copy),
+                                      label: const Text('Copy Lat'),
+                                      onPressed: () => Clipboard.setData(
+                                        ClipboardData(
+                                          text: _navOutLatController.text,
+                                        ),
+                                      ),
                                     ),
-                                    style: const TextStyle(
-                                      color: Colors.white70,
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.copy),
+                                      label: const Text('Copy Lon'),
+                                      onPressed: () => Clipboard.setData(
+                                        ClipboardData(
+                                          text: _navOutLonController.text,
+                                        ),
+                                      ),
                                     ),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: TextField(
-                                    readOnly: true,
-                                    controller: _navOutLonController,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Longitude (DMS)',
-                                      isDense: true,
-                                      border: OutlineInputBorder(),
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.call_made),
+                                      label: const Text('Send to Hospital'),
+                                      onPressed: () =>
+                                          _applyNavResultTo('hospital'),
                                     ),
-                                    style: const TextStyle(
-                                      color: Colors.white70,
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.call_made),
+                                      label: const Text('Send to WP1'),
+                                      onPressed: () =>
+                                          _applyNavResultTo('wpt1'),
                                     ),
-                                  ),
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.call_made),
+                                      label: const Text('Send to WP2'),
+                                      onPressed: () =>
+                                          _applyNavResultTo('wpt2'),
+                                    ),
+                                  ],
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 6),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 6,
-                              children: [
-                                OutlinedButton.icon(
-                                  icon: const Icon(Icons.copy),
-                                  label: const Text('Copy Lat'),
-                                  onPressed: () => Clipboard.setData(
-                                    ClipboardData(
-                                      text: _navOutLatController.text,
-                                    ),
-                                  ),
-                                ),
-                                OutlinedButton.icon(
-                                  icon: const Icon(Icons.copy),
-                                  label: const Text('Copy Lon'),
-                                  onPressed: () => Clipboard.setData(
-                                    ClipboardData(
-                                      text: _navOutLonController.text,
-                                    ),
-                                  ),
-                                ),
-                                OutlinedButton.icon(
-                                  icon: const Icon(Icons.call_made),
-                                  label: const Text('Send to Hospital'),
-                                  onPressed: () =>
-                                      _applyNavResultTo('hospital'),
-                                ),
-                                OutlinedButton.icon(
-                                  icon: const Icon(Icons.call_made),
-                                  label: const Text('Send to WP1'),
-                                  onPressed: () => _applyNavResultTo('wpt1'),
-                                ),
-                                OutlinedButton.icon(
-                                  icon: const Icon(Icons.call_made),
-                                  label: const Text('Send to WP2'),
-                                  onPressed: () => _applyNavResultTo('wpt2'),
-                                ),
-                              ],
-                            ),
-                          ],
+                          ),
                         ),
                       ),
-                    ),
-                  // ...existing code...
-                  const SizedBox(height: 16),
-
-                  const SizedBox(height: 16),
-                  if (useWindsAloft &&
-                      !standardWinds &&
-                      (_aiSuggestedIas != null ||
-                          _aiSuggestedAltitudeFt != null ||
-                          _aiTailwindKts != null))
-                    Card(
-                      color: Colors.blueGrey.shade800,
-                      margin: const EdgeInsets.symmetric(vertical: 8),
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'AI Flight Optimization',
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.cyanAccent,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            if (_aiSuggestedIas != null)
-                              Text(
-                                'Suggested IAS: ${_aiSuggestedIas?.toStringAsFixed(0) ?? '--'} kt',
-                                style: const TextStyle(color: Colors.white),
-                              ),
-                            if (_aiSuggestedAltitudeFt != null)
-                              Text(
-                                'Suggested Altitude: ${_aiSuggestedAltitudeFt?.toStringAsFixed(0) ?? '--'} ft',
-                                style: const TextStyle(color: Colors.white),
-                              ),
-                            // show per‑leg suggested altitudes when available (prevents unused-field warnings)
-                            if (_aiSuggestedAltitudeOutFt != null)
-                              Text(
-                                'Suggested Out Altitude: ${_aiSuggestedAltitudeOutFt?.toStringAsFixed(0) ?? '--'} ft',
-                                style: const TextStyle(color: Colors.white70),
-                              ),
-                            if (_aiSuggestedAltitudeBackFt != null)
-                              Text(
-                                'Suggested Back Altitude: ${_aiSuggestedAltitudeBackFt?.toStringAsFixed(0) ?? '--'} ft',
-                                style: const TextStyle(color: Colors.white70),
-                              ),
-                            if (_aiTailwindOutKts != null &&
-                                _aiTailwindBackKts != null)
-                              Builder(
-                                builder: (_) {
-                                  final out = _aiTailwindOutKts!;
-                                  final back = _aiTailwindBackKts!;
-                                  final avg = (out + back) / 2.0;
-                                  return Text(
-                                    '${_formatTailOrHead(out)} (Out) / ${_formatTailOrHead(back)} (Back)  (Avg ${avg.abs().toStringAsFixed(0)} kt)',
-                                    style: const TextStyle(
-                                      color: Colors.white70,
+                      const SizedBox(height: 16),
+                      (useWindsAloft &&
+                              !standardWinds &&
+                              (_aiSuggestedIas != null ||
+                                  _aiSuggestedAltitudeFt != null ||
+                                  _aiTailwindKts != null))
+                          ? Card(
+                              color: Colors.blueGrey.shade800,
+                              margin: const EdgeInsets.symmetric(vertical: 8),
+                              child: Padding(
+                                padding: const EdgeInsets.all(12),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      'AI Flight Optimization',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.cyanAccent,
+                                      ),
                                     ),
-                                  );
-                                },
-                              ),
-
-                            const SizedBox(height: 16),
-                            // ...existing code...
-                            // ...existing code...
-                            if (!autoApplyAi)
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                child: TextButton.icon(
-                                  onPressed:
-                                      (_aiSuggestedIas == null &&
-                                          _aiSuggestedAltitudeFt == null)
-                                      ? null
-                                      : applyAiSuggestions,
-                                  icon: const Icon(
-                                    Icons.check_circle,
-                                    color: Colors.cyanAccent,
-                                    size: 18,
-                                  ),
-                                  label: const Text(
-                                    'Apply Suggestions',
-                                    style: TextStyle(color: Colors.cyanAccent),
-                                  ),
+                                    const SizedBox(height: 4),
+                                    if (_aiSuggestedIas != null)
+                                      Text(
+                                        'Suggested IAS: ${_aiSuggestedIas?.toStringAsFixed(0) ?? '--'} kt',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    if (_aiSuggestedAltitudeFt != null)
+                                      Text(
+                                        'Suggested Altitude: ${_aiSuggestedAltitudeFt?.toStringAsFixed(0) ?? '--'} ft',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    // show per‑leg suggested altitudes when available (prevents unused-field warnings)
+                                    if (_aiSuggestedAltitudeOutFt != null)
+                                      Text(
+                                        'Suggested Out Altitude: ${_aiSuggestedAltitudeOutFt?.toStringAsFixed(0) ?? '--'} ft',
+                                        style: const TextStyle(
+                                          color: Colors.white70,
+                                        ),
+                                      ),
+                                    if (_aiSuggestedAltitudeBackFt != null)
+                                      Text(
+                                        'Suggested Back Altitude: ${_aiSuggestedAltitudeBackFt?.toStringAsFixed(0) ?? '--'} ft',
+                                        style: const TextStyle(
+                                          color: Colors.white70,
+                                        ),
+                                      ),
+                                    if (_aiTailwindOutKts != null &&
+                                        _aiTailwindBackKts != null)
+                                      Builder(
+                                        builder: (_) {
+                                          final out = _aiTailwindOutKts!;
+                                          final back = _aiTailwindBackKts!;
+                                          final avg = (out + back) / 2.0;
+                                          return Text(
+                                            '${_formatTailOrHead(out)} (Out) / ${_formatTailOrHead(back)} (Back)  (Avg ${avg.abs().toStringAsFixed(0)} kt)',
+                                            style: const TextStyle(
+                                              color: Colors.white70,
+                                            ),
+                                          );
+                                        },
+                                      ),
+                                    const SizedBox(height: 16),
+                                    // ...existing code...
+                                    // ...existing code...
+                                    if (!autoApplyAi)
+                                      Align(
+                                        alignment: Alignment.centerLeft,
+                                        child: TextButton.icon(
+                                          onPressed:
+                                              (_aiSuggestedIas == null &&
+                                                  _aiSuggestedAltitudeFt ==
+                                                      null)
+                                              ? null
+                                              : applyAiSuggestions,
+                                          icon: const Icon(
+                                            Icons.check_circle,
+                                            color: Colors.cyanAccent,
+                                            size: 18,
+                                          ),
+                                          label: const Text(
+                                            'Apply Suggestions',
+                                            style: TextStyle(
+                                              color: Colors.cyanAccent,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                  ],
                                 ),
                               ),
-                          ],
-                        ),
-                      ),
-                    ),
+                            )
+                          : const SizedBox.shrink(),
+                    ],
+                  ),
 
                   buildEquipmentToggles(
                     context,
@@ -2509,66 +4327,70 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                     },
                   ),
                   const SizedBox(height: 16),
-                  Row(
+                  Column(
                     children: [
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: _calculating
-                              ? null
-                              : () async {
-                                  setState(() => _calculating = true);
-                                  try {
-                                    await calculateCruise(); // default roundTrip = true
-                                  } finally {
-                                    if (mounted) {
-                                      setState(() => _calculating = false);
-                                    }
-                                  }
-                                },
-                          child: _calculating
-                              ? const SizedBox(
-                                  height: 20,
-                                  width: 20,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    valueColor: AlwaysStoppedAnimation(
-                                      Colors.white,
-                                    ),
-                                  ),
-                                )
-                              : const Text('Calculate'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: _calculating
-                              ? null
-                              : () async {
-                                  setState(() => _calculating = true);
-                                  try {
-                                    await calculateCruise(
-                                      roundTrip: false,
-                                    ); // single-trip
-                                  } finally {
-                                    if (mounted) {
-                                      setState(() => _calculating = false);
-                                    }
-                                  }
-                                },
-                          child: _calculating
-                              ? const SizedBox(
-                                  height: 20,
-                                  width: 20,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    valueColor: AlwaysStoppedAnimation(
-                                      Colors.white,
-                                    ),
-                                  ),
-                                )
-                              : const Text('Single-Trip'),
-                        ),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton(
+                              onPressed: _calculating
+                                  ? null
+                                  : () async {
+                                      setState(() => _calculating = true);
+                                      try {
+                                        await calculateCruise(); // default roundTrip = true
+                                      } finally {
+                                        if (mounted) {
+                                          setState(() => _calculating = false);
+                                        }
+                                      }
+                                    },
+                              child: _calculating
+                                  ? const SizedBox(
+                                      height: 20,
+                                      width: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        valueColor: AlwaysStoppedAnimation(
+                                          Colors.white,
+                                        ),
+                                      ),
+                                    )
+                                  : const Text('Calculate'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: ElevatedButton(
+                              onPressed: _calculating
+                                  ? null
+                                  : () async {
+                                      setState(() => _calculating = true);
+                                      try {
+                                        await calculateCruise(
+                                          roundTrip: false,
+                                        ); // single-trip
+                                      } finally {
+                                        if (mounted) {
+                                          setState(() => _calculating = false);
+                                        }
+                                      }
+                                    },
+                              child: _calculating
+                                  ? const SizedBox(
+                                      height: 20,
+                                      width: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        valueColor: AlwaysStoppedAnimation(
+                                          Colors.white,
+                                        ),
+                                      ),
+                                    )
+                                  : const Text('Single-Trip'),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -2818,6 +4640,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                   ),
 
                   // ...existing code...
+                  // ...existing code...
                   Row(
                     children: [
                       Expanded(
@@ -2837,10 +4660,131 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
                           onPressed: _lastReport == null
                               ? null
                               : () {
-                                  CruiseReportExporter.share(_lastReport!);
+                                  CruiseReportExporter.share(
+                                    context,
+                                    _lastReport!,
+                                  );
                                 },
                           icon: const Icon(Icons.share),
                           label: const Text('Share'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: () async {
+                            final messenger = ScaffoldMessenger.of(
+                              context,
+                            ); // cache before awaits
+
+                            // route with SAR expansion
+                            final pts = <LatLng>[];
+                            final oLat = _parseCoord(
+                              originLatController.text,
+                              isLat: true,
+                            );
+                            final oLon = _parseCoord(
+                              originLonController.text,
+                              isLat: false,
+                            );
+                            final dLat = _parseCoord(
+                              destLatController.text,
+                              isLat: true,
+                            );
+                            final dLon = _parseCoord(
+                              destLonController.text,
+                              isLat: false,
+                            );
+                            if (oLat.isFinite && oLon.isFinite) {
+                              pts.add(LatLng(oLat, oLon));
+                            }
+                            for (final wp in _waypoints) {
+                              if (!wp.enabled) continue;
+                              final wLat = _parseCoord(
+                                wp.lat.text,
+                                isLat: true,
+                              );
+                              final wLon = _parseCoord(
+                                wp.lon.text,
+                                isLat: false,
+                              );
+                              if (wLat.isFinite && wLon.isFinite) {
+                                final anchor = LatLng(wLat, wLon);
+                                pts.add(anchor);
+                                _appendPatternIfAny(pts, wp.id, anchor);
+                              }
+                            }
+                            if (dLat.isFinite && dLon.isFinite) {
+                              pts.add(LatLng(dLat, dLon));
+                            }
+                            if (pts.length < 2) {
+                              messenger.showSnackBar(
+                                const SnackBar(
+                                  content: Text('Enter valid route first'),
+                                ),
+                              );
+                              return;
+                            }
+
+                            // Build KML with a separate SAR folder
+                            final kml = RouteExportKml.buildKmlWithSar(
+                              pts,
+                              name: 'AW139 Mission',
+                              sarPatterns: _sarPatternByWp,
+                              sarColorArgbById: _sarArgbMap(),
+                            );
+
+                            final saveLocation = await getSaveLocation(
+                              suggestedName: 'route.kml',
+                              acceptedTypeGroups: const [
+                                XTypeGroup(label: 'KML', extensions: ['kml']),
+                              ],
+                            );
+                            if (saveLocation == null) {
+                              await Clipboard.setData(ClipboardData(text: kml));
+                              messenger.showSnackBar(
+                                const SnackBar(
+                                  content: Text('KML copied to clipboard'),
+                                ),
+                              );
+                              return;
+                            }
+
+                            final data = Uint8List.fromList(utf8.encode(kml));
+                            final xfile = XFile.fromData(
+                              data,
+                              name: 'route.kml',
+                              mimeType: 'application/vnd.google-earth.kml+xml',
+                            );
+                            await xfile.saveTo(saveLocation.path);
+                            messenger.showSnackBar(
+                              SnackBar(
+                                content: Text('Saved: ${saveLocation.path}'),
+                              ),
+                            );
+                          },
+                          icon: const Icon(Icons.route),
+                          label: const Text('Export KML'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: savePlanJson,
+                          icon: const Icon(Icons.save),
+                          label: const Text('Save Plan (JSON)'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: loadPlanJson,
+                          icon: const Icon(Icons.folder_open),
+                          label: const Text('Load Plan (JSON)'),
                         ),
                       ),
                     ],
@@ -2849,7 +4793,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
               ),
             ),
           );
-          // ...existing code...
+
           // ...existing code...
           // local snapshot values for charts (avoid IIFE inside children)
           final isBell412 = _selectedAircraft == 'Bell 412';
@@ -3682,6 +5626,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     if (_selectedAircraft == 'Bell 412') {
       fuelOnboard = lbsToKg(fuelOnboard);
     }
+    // PNR: parse reserve fuel (display units -> kg internal)
+    reserveFuel = _parseNumber(reserveController.text);
+    double reserveKg = reserveFuel;
+    if (_selectedAircraft == 'Bell 412') {
+      reserveKg = lbsToKg(reserveFuel);
+    }
     extraHoistMinutes = _parseNumber(hoistTimeController.text);
 
     // Input validation
@@ -3727,11 +5677,15 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       }
       // Use draggable mid-route waypoints in current order
       for (final wp in _waypoints) {
-        if (!wp.enabled) continue;
+        if (!wp.enabled) {
+          continue;
+        }
         final wLat = _parseCoord(wp.lat.text, isLat: true);
         final wLon = _parseCoord(wp.lon.text, isLat: false);
         if (wLat.isFinite && wLon.isFinite) {
-          points.add(LatLng(wLat, wLon));
+          final anchor = LatLng(wLat, wLon);
+          points.add(anchor);
+          _appendPatternIfAny(points, wp.id, anchor);
         }
       }
       if (destLat.isFinite && destLon.isFinite) {
@@ -3774,8 +5728,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     if (originLon.isFinite) {
       originLonController.text = originLon.toStringAsFixed(6);
     }
-    if (destLat.isFinite) destLatController.text = destLat.toStringAsFixed(6);
-    if (destLon.isFinite) destLonController.text = destLon.toStringAsFixed(6);
+    if (destLat.isFinite) {
+      destLatController.text = destLat.toStringAsFixed(6);
+    }
+    if (destLon.isFinite) {
+      destLonController.text = destLon.toStringAsFixed(6);
+    }
 
     // Fetch winds & AI suggestions
     if (useWindsAloft && !standardWinds) {
@@ -3808,8 +5766,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
           _destinationWindsAloft = _aiWindsAloft;
         }
 
-        if (_aiTailwindOutKts != null) tailwindOut = _aiTailwindOutKts!;
-        if (_aiTailwindBackKts != null) tailwindBack = _aiTailwindBackKts!;
+        if (_aiTailwindOutKts != null) {
+          tailwindOut = _aiTailwindOutKts!;
+        }
+        if (_aiTailwindBackKts != null) {
+          tailwindBack = _aiTailwindBackKts!;
+        }
 
         // Auto apply (only if data present)
         if (autoApplyAi) {
@@ -3867,6 +5829,24 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
     final endurance = fuelOnboard / adjustedFuelBurn;
     final estimatedRange = cruiseSpeed * endurance;
 
+    // SAR breakdown (always use 70 knots IAS for SAR fuel/time)
+    final sarDistanceNm = _sarDistanceOneWayNm();
+    final sarIas = 70.0;
+    final sarAltitude = 500; // Always use 500 ft for SAR search patterns
+    final sarBurnKgPerHr =
+        (_selectedAircraft == 'Bell 412' && bh412Tables.isNotEmpty)
+        ? lbsToKg(
+            _bh412GetBurn(sarAltitude, temperature.toInt(), sarIas) ?? 0.0,
+          )
+        : interpolateFuelBurn(
+            getTorqueForIAS(sarAltitude, temperature.toInt(), sarIas),
+            sarAltitude,
+            temperature.toInt(),
+          );
+    final sarTimeOutHrs = sarDistanceNm / sarIas;
+    final sarTimeBackHrs = roundTrip ? (sarDistanceNm / sarIas) : 0.0;
+    final sarTimeHours = sarTimeOutHrs + sarTimeBackHrs;
+    final sarFuelKg = sarBurnKgPerHr * sarTimeHours;
     // Hoist / hover
     final hoistBlocks = (extraHoistMinutes / 5.0).ceil();
     final hoistMinutesRounded = hoistBlocks * 5.0;
@@ -3890,12 +5870,49 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       intervalMin: 20,
     );
 
-    setState(() {
-      _lastRequiredTorque = perf['recommendedTorque']!;
-      _lastAdjustedFuelBurn = adjustedFuelBurn;
-      _lastFuelRemaining = fuelRemainingAfterMission;
-    });
+    // PNR: compute distance and map point
+    {
+      final routePts = <LatLng>[];
+      if (originLat.isFinite && originLon.isFinite) {
+        routePts.add(LatLng(originLat, originLon));
+      }
+      for (final wp in _waypoints) {
+        if (!wp.enabled) continue;
+        final wLat = _parseCoord(wp.lat.text, isLat: true);
+        final wLon = _parseCoord(wp.lon.text, isLat: false);
+        if (!wLat.isFinite || !wLon.isFinite) continue;
+        final anchor = LatLng(wLat, wLon);
+        routePts.add(anchor);
+        if (includeSarInPnr) {
+          _appendPatternIfAny(routePts, wp.id, anchor);
+        }
+      }
+      if (destLat.isFinite && destLon.isFinite) {
+        routePts.add(LatLng(destLat, destLon));
+      }
 
+      final pnrNmRaw = _computePnrNm(
+        fuelOnboardKg: fuelOnboard,
+        reserveKg: reserveKg,
+        hoistMinutes: extraHoistMinutes,
+        burnKgPerHr: adjustedFuelBurn,
+        gsOutKts: gsOut,
+        gsBackKts: gsBack,
+      );
+      final pnrNm = d > 0 ? pnrNmRaw.clamp(0.0, d) : 0.0;
+      LatLng? pnrPoint;
+      if (routePts.length >= 2 && pnrNm > 0) {
+        pnrPoint = _pointAlongRoute(routePts, pnrNm);
+      }
+
+      setState(() {
+        _lastRequiredTorque = perf['recommendedTorque']!;
+        _lastAdjustedFuelBurn = adjustedFuelBurn;
+        _lastFuelRemaining = fuelRemainingAfterMission;
+        _pnrNm = pnrNm;
+        _pnrPoint = pnrPoint;
+      });
+    }
     if (!mounted) return;
     showCruiseResultsDialog(
       context: context,
@@ -3925,6 +5942,9 @@ class CruiseInputScreenState extends State<CruiseInputScreen> {
       destLat: destLat.isFinite ? destLat : null,
       destLon: destLon.isFinite ? destLon : null,
       roundTrip: roundTrip,
+      sarDistanceNm: sarDistanceNm,
+      sarTimeHours: sarTimeHours,
+      sarFuelKg: sarFuelKg,
     );
     // Winds Aloft for PDF/export
     final windData =

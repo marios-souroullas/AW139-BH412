@@ -116,6 +116,54 @@
       "languageVersion": "3.0"
     },
     {
+      "name": "file_selector",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector-1.0.4",
+      "packageUri": "lib/",
+      "languageVersion": "3.7"
+    },
+    {
+      "name": "file_selector_android",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector_android-0.5.2+1",
+      "packageUri": "lib/",
+      "languageVersion": "3.9"
+    },
+    {
+      "name": "file_selector_ios",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector_ios-0.5.3+3",
+      "packageUri": "lib/",
+      "languageVersion": "3.9"
+    },
+    {
+      "name": "file_selector_linux",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector_linux-0.9.3+2",
+      "packageUri": "lib/",
+      "languageVersion": "3.3"
+    },
+    {
+      "name": "file_selector_macos",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector_macos-0.9.4+5",
+      "packageUri": "lib/",
+      "languageVersion": "3.9"
+    },
+    {
+      "name": "file_selector_platform_interface",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector_platform_interface-2.6.2",
+      "packageUri": "lib/",
+      "languageVersion": "3.0"
+    },
+    {
+      "name": "file_selector_web",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector_web-0.9.4+2",
+      "packageUri": "lib/",
+      "languageVersion": "3.3"
+    },
+    {
+      "name": "file_selector_windows",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/file_selector_windows-0.9.3+4",
+      "packageUri": "lib/",
+      "languageVersion": "3.4"
+    },
+    {
       "name": "fixnum",
       "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/fixnum-1.1.1",
       "packageUri": "lib/",
@@ -429,7 +477,7 @@
     },
     {
       "name": "share_plus",
-      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/share_plus-12.0.0",
+      "rootUri": "file:///C:/Users/Fujitsu%20Lifebook/AppData/Local/Pub/Cache/hosted/pub.dev/share_plus-12.0.1",
       "packageUri": "lib/",
       "languageVersion": "3.4"
     },

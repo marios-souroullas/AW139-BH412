@@ -9,7 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-
+  flutter_map: ^8.2.2
+  latlong2: ^0.9.0
   cupertino_icons: ^1.0.8
   shared_preferences: ^2.2.3
   fl_chart: ^1.1.1
@@ -19,10 +20,6 @@ dependencies:
   printing: ^5.12.0
   share_plus: ^12.0.1
   url_launcher: ^6.3.0
-
-  # Map package replacements
-  flutter_map: ^8.2.2
-  latlong2: ^0.9.0
   google_fonts: ^6.0.0
   file_selector: ^1.0.4
   path_provider: ^2.1.5
@@ -34,11 +31,22 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-
   assets:
     - assets/fonts/
     - assets/performance_tables/bell_412.csv
-
+    - assets/airports/cy_apt.geojson
+    - assets/airspaces/cy_asp.geojson
+    - assets/navaids/cy_nav.geojson
+    - assets/obstacles/cy_obs.json
+    - assets/obstacles/gr_obs.geojson
+    - assets/airports/gr_apt.geojson
+    - assets/navaids/gr_nav.geojson
+    - assets/reporting_points/gr_rpp.geojson
+    - assets/obstacles/il_obs.geojson
+    - assets/airports/il_apt.geojson
+    - assets/navaids/il_nav.geojson
+    - assets/reporting_points/il_rpp.geojson
+    
   fonts:
     - family: NotoSans
       fonts:

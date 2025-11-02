@@ -271,10 +271,12 @@ class CruiseReportExporter {
           _kv('Temperature', '${d.temperature.toStringAsFixed(0)} °C'),
           _kv('Hoist Time', '${d.hoistMinutes.toStringAsFixed(0)} min'),
           _kv('Hoist Fuel', '${hoistFuelDisp.toStringAsFixed(0)} $unit'),
-          if (d.originDmsLat != null && d.originDmsLon != null)
+          if (d.originDmsLat != null && d.originDmsLon != null) ...[
             _kv('Origin', '${d.originDmsLat}  ${d.originDmsLon}'),
-          if (d.destDmsLat != null && d.destDmsLon != null)
+          ],
+          if (d.destDmsLat != null && d.destDmsLon != null) ...[
             _kv('Destination', '${d.destDmsLat}  ${d.destDmsLon}'),
+          ],
           if (d.aiAlt != null ||
               d.aiIas != null ||
               (d.aiTailOut != null && d.aiTailBack != null)) ...[
@@ -410,34 +412,175 @@ class CruiseReportExporter {
   }
 
   // Build a PDF that contains ONLY winds aloft (departure/destination)
+  // It can accept full profile maps (alt -> { tailwind, dir, pressure, rawSpeedMps })
+  // and will render lines similar to the on-screen dialog. Also accepts METAR/TAF text.
   static Future<Uint8List> _buildWindsOnlyPdf({
+    // optional simple tailwind maps (alt -> tailwind)
     Map<int, double>? departure,
     Map<int, double>? destination,
+    // optional full profiles (alt -> { 'tailwind':.., 'dir':.., 'pressure':.., 'rawSpeedMps':.. })
+    Map<int, Map<String, double>>? departureProfile,
+    Map<int, Map<String, double>>? destinationProfile,
+    // optional METAR/TAF strings
+    String? originMetar,
+    String? originTaf,
+    String? destMetar,
+    String? destTaf,
+    String? extraMetar,
+    String? extraTaf,
   }) async {
+    String tailOrHead(double v) =>
+        '${v >= 0 ? 'Tailwind' : 'Headwind'} ${v.abs().toStringAsFixed(0)} kt';
+
     final doc = pw.Document();
     doc.addPage(
       pw.MultiPage(
         pageTheme: pw.PageTheme(margin: const pw.EdgeInsets.all(28)),
-        build: (_) => [
-          pw.Header(
-            level: 0,
-            child: pw.Text(
-              'Winds Aloft',
-              style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold),
+        build: (_) {
+          final List<pw.Widget> page = [];
+
+          page.add(
+            pw.Header(
+              level: 0,
+              child: pw.Text(
+                'Winds Aloft',
+                style: pw.TextStyle(
+                  fontSize: 22,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
             ),
-          ),
-          if ((departure ?? {}).isEmpty && (destination ?? {}).isEmpty)
-            pw.Text('No winds aloft data available.'),
-          if ((departure ?? {}).isNotEmpty)
-            _windsOnlyTable('Departure Winds Aloft', departure),
-          if ((destination ?? {}).isNotEmpty)
-            _windsOnlyTable('Destination Winds Aloft', destination),
-          pw.SizedBox(height: 16),
-          pw.Text(
-            'Advisory only. Verify with official weather sources.',
-            style: pw.TextStyle(fontSize: 9, color: PdfColors.grey600),
-          ),
-        ],
+          );
+
+          if (originMetar != null ||
+              originTaf != null ||
+              destMetar != null ||
+              destTaf != null ||
+              extraMetar != null ||
+              extraTaf != null) {
+            page.add(
+              pw.Text(
+                'Weather (METAR / TAF)',
+                style: pw.TextStyle(
+                  fontSize: 14,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+            );
+            if (originMetar != null) {
+              page.add(_kv('Origin METAR', originMetar));
+            }
+            if (originTaf != null) {
+              page.add(_kv('Origin TAF', originTaf));
+            }
+            if (destMetar != null) {
+              page.add(_kv('Destination METAR', destMetar));
+            }
+            if (destTaf != null) {
+              page.add(_kv('Destination TAF', destTaf));
+            }
+            if (extraMetar != null) {
+              page.add(_kv('Extra ICAO METAR', extraMetar));
+            }
+            if (extraTaf != null) {
+              page.add(_kv('Extra ICAO TAF', extraTaf));
+            }
+            page.add(pw.SizedBox(height: 8));
+          }
+
+          // Render departure profile (prefer full profile if provided)
+          if ((departureProfile ?? {}).isNotEmpty) {
+            final entries = departureProfile!.entries.toList()
+              ..sort((a, b) => a.key.compareTo(b.key));
+            page.add(
+              pw.Text(
+                'Departure Winds Aloft',
+                style: pw.TextStyle(
+                  fontSize: 13,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+            );
+            page.add(pw.SizedBox(height: 6));
+            for (final e in entries) {
+              final alt = e.key;
+              final m = e.value;
+              final pressure = (m['pressure'] != null && m['pressure']! > 0)
+                  ? m['pressure']!.toStringAsFixed(0)
+                  : '--';
+              final rawSpeedMps = m['rawSpeedMps'] ?? 0.0;
+              final rawKt = rawSpeedMps * 1.94384449;
+              final dir = (m['dir'] ?? 0.0).toStringAsFixed(0);
+              final tail = m['tailwind'] ?? 0.0;
+              page.add(
+                pw.Text(
+                  '$alt ft ($pressure hPa): raw ${rawKt.toStringAsFixed(1)} kt @ $dir° — ${tailOrHead(tail)}',
+                  style: pw.TextStyle(fontSize: 11),
+                ),
+              );
+            }
+            page.add(pw.SizedBox(height: 8));
+          } else if ((departure ?? {}).isNotEmpty) {
+            page.add(
+              pw.Text(
+                'Departure Winds Aloft',
+                style: pw.TextStyle(
+                  fontSize: 13,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+            );
+            page.add(_windsOnlyTable('Departure Winds Aloft', departure));
+          }
+
+          // Render destination profile
+          if ((destinationProfile ?? {}).isNotEmpty) {
+            final entries = destinationProfile!.entries.toList()
+              ..sort((a, b) => a.key.compareTo(b.key));
+            page.add(pw.SizedBox(height: 8));
+            page.add(
+              pw.Text(
+                'Destination Winds Aloft',
+                style: pw.TextStyle(
+                  fontSize: 13,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+            );
+            page.add(pw.SizedBox(height: 6));
+            for (final e in entries) {
+              final alt = e.key;
+              final m = e.value;
+              final pressure = (m['pressure'] != null && m['pressure']! > 0)
+                  ? m['pressure']!.toStringAsFixed(0)
+                  : '--';
+              final rawSpeedMps = m['rawSpeedMps'] ?? 0.0;
+              final rawKt = rawSpeedMps * 1.94384449;
+              final dir = (m['dir'] ?? 0.0).toStringAsFixed(0);
+              final tail = m['tailwind'] ?? 0.0;
+              page.add(
+                pw.Text(
+                  '$alt ft ($pressure hPa): raw ${rawKt.toStringAsFixed(1)} kt @ $dir° — ${tailOrHead(tail)}',
+                  style: pw.TextStyle(fontSize: 11),
+                ),
+              );
+            }
+            page.add(pw.SizedBox(height: 8));
+          } else if ((destination ?? {}).isNotEmpty) {
+            page.add(pw.SizedBox(height: 8));
+            page.add(_windsOnlyTable('Destination Winds Aloft', destination));
+          }
+
+          page.add(pw.SizedBox(height: 12));
+          page.add(
+            pw.Text(
+              'Advisory only. Verify with official weather sources.',
+              style: pw.TextStyle(fontSize: 9, color: PdfColors.grey600),
+            ),
+          );
+
+          return page;
+        },
       ),
     );
     return doc.save();
@@ -447,10 +590,26 @@ class CruiseReportExporter {
   static Future<void> previewWindsOnly({
     Map<int, double>? departure,
     Map<int, double>? destination,
+    Map<int, Map<String, double>>? departureProfile,
+    Map<int, Map<String, double>>? destinationProfile,
+    String? originMetar,
+    String? originTaf,
+    String? destMetar,
+    String? destTaf,
+    String? extraMetar,
+    String? extraTaf,
   }) async {
     final data = await _buildWindsOnlyPdf(
       departure: departure,
       destination: destination,
+      departureProfile: departureProfile,
+      destinationProfile: destinationProfile,
+      originMetar: originMetar,
+      originTaf: originTaf,
+      destMetar: destMetar,
+      destTaf: destTaf,
+      extraMetar: extraMetar,
+      extraTaf: extraTaf,
     );
     await Printing.layoutPdf(onLayout: (_) async => data);
   }

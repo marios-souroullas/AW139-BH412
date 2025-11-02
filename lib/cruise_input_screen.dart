@@ -7,16 +7,20 @@ import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
 import 'package:flutter/services.dart'
     show rootBundle, Clipboard, ClipboardData;
 import 'package:aw139_cruise/export/route_export_kml.dart';
-import 'dart:convert' show utf8, jsonDecode, JsonEncoder;
+import 'dart:convert' show utf8, jsonDecode, JsonEncoder, jsonEncode;
 import 'dart:typed_data' show Uint8List;
 import 'package:file_selector/file_selector.dart';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'dart:async';
+import 'dart:convert';
 
 // Windy API key (keep private). Replace YOUR_REAL_WINDY_KEY with your key.
 const String kWindyApiKey = 'a4wqVgw3RBBPbjA0PjMtmD1I9PK0ndAX';
+
+const String kAvwxApiToken =
+    'f03J12T09f6TiY6YqSR39M8Sv6o-bEkieivjBnVi_C8'; // <-- put your AVWX token here (keep private)
 
 enum WindProvider { openMeteo, windy }
 
@@ -70,7 +74,7 @@ class SarParams {
 
 // OpenWeatherMap API key (replace with your OpenWeatherMap key).
 // Do NOT commit this value to a public repo.
-const String kOpenWeatherApiKey = 'f7084ce97f81d6e4e49b7f393aa69da4';
+const String kOpenWeatherApiKey = '2bfda15eb1d3c7ea910fc5cc180ab4ad';
 
 const Color kPanelColor = Color(0xFF2A2A2A);
 double _parseNumber(String s) {
@@ -1094,6 +1098,11 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
   // Additional coordinate controllers (waypoint / hospital / waypoint2)
   final waypoint2LatController = TextEditingController();
   final waypoint2LonController = TextEditingController();
+  final TextEditingController originIcaoController = TextEditingController();
+  final TextEditingController destIcaoController = TextEditingController();
+
+  // simple cache for airport lookup
+  Map<String, LatLng>? _airportIcaoCache; // ICAO (upper) -> LatLng
 
   final Map<String, TextEditingController> _sarHeadingCtrls = {};
   final MapController _mapController = MapController();
@@ -1116,6 +1125,94 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
     if (!v.isFinite) return v;
     final n = v % 360.0;
     return n < 0 ? n + 360.0 : n;
+  }
+
+  // Paste near the top of your CruiseInputScreenState class (or as a static const outside the class)
+  final List<Map<String, dynamic>> cyprusAirports = [
+    {'icao': 'LCLK', 'name': 'Larnaca', 'lat': 34.875, 'lon': 33.624},
+    {'icao': 'LCPH', 'name': 'Paphos', 'lat': 34.718, 'lon': 32.485},
+    {'icao': 'LCEN', 'name': 'Ercan', 'lat': 35.154, 'lon': 33.496},
+    {'icao': 'LCRA', 'name': 'Akrotiri', 'lat': 34.590, 'lon': 32.987},
+    {'icao': 'LCGK', 'name': 'Gecitkale', 'lat': 35.235, 'lon': 33.724},
+    // Add more if needed
+  ];
+
+  // Helper to find the closest Cyprus airport ICAO to given coordinates
+  String getClosestCyprusIcao(double lat, double lon) {
+    double minDist = double.infinity;
+    String closestIcao = '';
+    for (final ap in cyprusAirports) {
+      final dLat = lat - (ap['lat'] as double);
+      final dLon = lon - (ap['lon'] as double);
+      final dist = dLat * dLat + dLon * dLon;
+      if (dist < minDist) {
+        minDist = dist;
+        closestIcao = ap['icao'] as String;
+      }
+    }
+    return closestIcao;
+  }
+
+  Future<String?> fetchMetarRaw(String icao) async {
+    icao = icao.trim().toUpperCase();
+    if (icao.isEmpty) return null;
+
+    final uri = Uri.parse('https://avwx.rest/api/metar/$icao?format=json');
+
+    try {
+      final resp = await http.get(
+        uri,
+        headers: {
+          'Authorization': 'Bearer $kAvwxApiToken',
+          'Accept': 'application/json',
+        },
+      );
+      if (kDebugMode) {
+        debugPrint('METAR status: ${resp.statusCode}, body: ${resp.body}');
+      }
+      if (resp.statusCode == 200) {
+        final Map<String, dynamic> j =
+            jsonDecode(resp.body) as Map<String, dynamic>;
+        return j['raw'] ?? j['raw_text'] ?? jsonEncode(j);
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('METAR fetch error: $e');
+      }
+      return null;
+    }
+  }
+
+  Future<String?> fetchTafRaw(String icao) async {
+    icao = icao.trim().toUpperCase();
+    if (icao.isEmpty) return null;
+
+    final uri = Uri.parse('https://avwx.rest/api/taf/$icao?format=json');
+
+    try {
+      final resp = await http.get(
+        uri,
+        headers: {
+          'Authorization': 'Bearer $kAvwxApiToken',
+          'Accept': 'application/json',
+        },
+      );
+      if (kDebugMode) {
+        debugPrint('TAF status: ${resp.statusCode}, body: ${resp.body}');
+      }
+      if (resp.statusCode == 200) {
+        final Map<String, dynamic> j =
+            jsonDecode(resp.body) as Map<String, dynamic>;
+        return j['raw'] ?? j['raw_text'] ?? jsonEncode(j);
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('TAF fetch error: $e');
+      }
+      return null;
+    }
   }
 
   // Ensure params exist for a waypoint for current type
@@ -1195,6 +1292,136 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
         radialDeg: bearingDeg,
         distanceNm: distNm,
       );
+
+  // --- METAR/TAF state and fetch logic ---
+  final TextEditingController _icaoController = TextEditingController();
+
+  // Returns LatLng or null if not found.
+  // Looks up in cached airport asset; supports multiple geojson files.
+  Future<LatLng?> resolveIcaoToLatLon(String icao) async {
+    final key = icao.trim().toUpperCase();
+    if (key.isEmpty) return null;
+
+    // load/cache mapping once
+    if (_airportIcaoCache == null) {
+      _airportIcaoCache = {};
+      final files = [
+        'assets/airports/cy_apt.geojson',
+        'assets/airports/gr_apt.geojson',
+        'assets/airports/il_apt.geojson',
+        // add more as needed
+      ];
+      for (final file in files) {
+        try {
+          final s = await rootBundle.loadString(file);
+          final j = jsonDecode(s) as Map<String, dynamic>;
+          final features = (j['features'] as List<dynamic>?) ?? [];
+          for (final f in features) {
+            try {
+              final props = (f['properties'] ?? {}) as Map<String, dynamic>;
+              final id =
+                  (props['icaoCode'] ??
+                          props['ICAO'] ??
+                          props['ident'] ??
+                          props['icao'] ??
+                          props['icao_code'])
+                      ?.toString();
+              final geom = f['geometry'] as Map<String, dynamic>?;
+              if (id == null || geom == null) continue;
+              final coords = (geom['coordinates'] as List<dynamic>?);
+              if (coords == null || coords.length < 2) continue;
+              final lon = (coords[0] as num).toDouble();
+              final lat = (coords[1] as num).toDouble();
+              _airportIcaoCache![id.toUpperCase()] = LatLng(lat, lon);
+            } catch (_) {
+              // skip malformed feature
+              continue;
+            }
+          }
+        } catch (e) {
+          if (kDebugMode) debugPrint('resolveIcaoToLatLon load error: $e');
+          continue;
+        }
+      }
+    }
+
+    return _airportIcaoCache![key];
+  }
+
+  String? _metarOrigin, _tafOrigin;
+  String? _metarDest, _tafDest;
+  String? _metarExtra, _tafExtra;
+  bool _loadingMetar = false, _loadingTaf = false;
+
+  String? originMetar;
+  String? destMetar;
+
+  // Fetch for origin/destination (call when mission plan changes)
+  Future<void> fetchOriginDestMetarTaf(
+    String originIcao,
+    String destIcao,
+  ) async {
+    // show loading
+    if (!mounted) return;
+    setState(() {
+      _loadingMetar = true;
+      _loadingTaf = true;
+    });
+
+    try {
+      final metarOriginRaw = await fetchMetarRaw(originIcao);
+      final tafOriginRaw = await fetchTafRaw(originIcao);
+      final metarDestRaw = await fetchMetarRaw(destIcao);
+      final tafDestRaw = await fetchTafRaw(destIcao);
+
+      if (!mounted) return;
+      setState(() {
+        // keep the old names and the new names in sync
+        _metarOrigin = metarOriginRaw;
+        _tafOrigin = tafOriginRaw;
+        _metarDest = metarDestRaw;
+        _tafDest = tafDestRaw;
+
+        originMetar = metarOriginRaw;
+        destMetar = metarDestRaw;
+
+        _loadingMetar = false;
+        _loadingTaf = false;
+      });
+
+      // Short debug print (safe while debugging)
+      debugPrint(
+        'fetchOriginDestMetarTaf: $originIcao -> ${metarOriginRaw ?? "null"}',
+      );
+      debugPrint(
+        'fetchOriginDestMetarTaf: $destIcao -> ${metarDestRaw ?? "null"}',
+      );
+    } catch (e, st) {
+      if (kDebugMode) debugPrint('fetchOriginDestMetarTaf error: $e\n$st');
+      if (!mounted) return;
+      setState(() {
+        _loadingMetar = false;
+        _loadingTaf = false;
+      });
+    }
+  }
+
+  // Fetch for extra ICAO (user input)
+  void fetchExtraMetarTaf() async {
+    final icao = _icaoController.text.trim().toUpperCase();
+    if (icao.length == 4) {
+      setState(() {
+        _loadingMetar = true;
+        _loadingTaf = true;
+      });
+      _metarExtra = await fetchMetarRaw(icao);
+      _tafExtra = await fetchTafRaw(icao);
+      setState(() {
+        _loadingMetar = false;
+        _loadingTaf = false;
+      });
+    }
+  }
 
   // Helper: append pattern pts (skip first if same anchor) into pts
   void _appendPatternIfAny(List<LatLng> pts, String wpId, LatLng anchor) {
@@ -1601,8 +1828,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
   LatLng? _pnrPoint; // Geographic position along route for map pin
 
   // Nav tool controllers/state
-  final _navRadialController = TextEditingController(text: '090');
-  final _navDistanceController = TextEditingController(text: '10'); // NM
+  final _navRadialController = TextEditingController(text: '210');
+  final _navDistanceController = TextEditingController(text: '40'); // NM
   int _selectedFixIndex = 0; // must be mutable for Dropdown
   // ignore: unused_field
   String? _navResultDecimal;
@@ -2126,6 +2353,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
     hospitalLonController.dispose();
     waypoint2LatController.dispose();
     waypoint2LonController.dispose();
+    originIcaoController.dispose();
+    destIcaoController.dispose();
 
     // Nav tool controllers
     _navRadialController.dispose();
@@ -2140,8 +2369,6 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
       c.dispose();
     }
   }
-
-  // ---------- Coordinate Handling ----------
 
   void _formatControllerToDms(TextEditingController c, {required bool isLat}) {
     if (!keepDmsFormat) return;
@@ -2203,6 +2430,12 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
     final newHospitalLonError = useHospitalWaypoint
         ? valErr(hLon, false, rawHLon)
         : null;
+
+    if (oLat.isFinite && oLon.isFinite && dLat.isFinite && dLon.isFinite) {
+      final originIcao = getClosestCyprusIcao(oLat, oLon);
+      final destIcao = getClosestCyprusIcao(dLat, dLon);
+      fetchOriginDestMetarTaf(originIcao, destIcao);
+    }
 
     bool changed =
         newOriginLatError != originLatError ||
@@ -3059,6 +3292,43 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                   ),
                   buildInputField('Hoist Time (min)', hoistTimeController),
                   const SizedBox(height: 16),
+                  // ...existing code...
+
+                  // Origin ICAO — auto-resolve like coord fields
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6.0),
+                    child: TextField(
+                      controller: originIcaoController,
+                      decoration: const InputDecoration(
+                        labelText: 'Origin ICAO (optional)',
+                        hintText: 'e.g. LCPH',
+                      ),
+                      onChanged: (v) async {
+                        final code = v.trim().toUpperCase();
+                        if (code.length == 4 &&
+                            RegExp(r'^[A-Z0-9]{4}$').hasMatch(code)) {
+                          try {
+                            final latlon = await resolveIcaoToLatLon(code);
+                            debugPrint(
+                              'ICAO lookup for $code returned: $latlon',
+                            );
+                            if (latlon != null) {
+                              originLatController.text = latlon.latitude
+                                  .toStringAsFixed(6);
+                              originLonController.text = latlon.longitude
+                                  .toStringAsFixed(6);
+                              _validateAndDistance();
+                            }
+                          } catch (e) {
+                            if (kDebugMode) {
+                              debugPrint('ICAO auto-lookup error (origin): $e');
+                            }
+                          }
+                        }
+                      },
+                    ),
+                  ),
+
                   coordField(
                     'Origin Latitude',
                     originLatController,
@@ -3070,6 +3340,42 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                     originLonController,
                     isLat: false,
                     errorText: originLonError,
+                  ),
+
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6.0),
+                    child: TextField(
+                      controller: destIcaoController,
+                      decoration: const InputDecoration(
+                        labelText: 'Destination ICAO (optional)',
+                        hintText: 'e.g. LCPH',
+                      ),
+                      onChanged: (v) async {
+                        final code = v.trim().toUpperCase();
+                        if (code.length == 4 &&
+                            RegExp(r'^[A-Z0-9]{4}$').hasMatch(code)) {
+                          try {
+                            final latlon = await resolveIcaoToLatLon(code);
+                            debugPrint(
+                              'ICAO lookup for $code returned: $latlon',
+                            );
+                            if (latlon != null) {
+                              destLatController.text = latlon.latitude
+                                  .toStringAsFixed(6);
+                              destLonController.text = latlon.longitude
+                                  .toStringAsFixed(6);
+                              _validateAndDistance();
+                            }
+                          } catch (e) {
+                            if (kDebugMode) {
+                              debugPrint(
+                                'ICAO auto-lookup error (destination): $e',
+                              );
+                            }
+                          }
+                        }
+                      },
+                    ),
                   ),
                   coordField(
                     'Destination Latitude',
@@ -3083,7 +3389,51 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                     isLat: false,
                     errorText: destLonError,
                   ),
+                  // ...existing code...
+                  // ...existing code...
                   buildWaypointPlanner(),
+                  // METAR/TAF UI section
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // prefer _metarOrigin/_metarDest (they are set together with originMetar/destMetar)
+                      Text(
+                        'Origin METAR: ${_metarOrigin ?? originMetar ?? "No METAR for origin"}',
+                      ),
+                      Text('Origin TAF: ${_tafOrigin ?? "—"}'),
+                      SizedBox(height: 8),
+                      Text(
+                        'Destination METAR: ${_metarDest ?? destMetar ?? "No METAR for destination"}',
+                      ),
+                      Text('Destination TAF: ${_tafDest ?? "—"}'),
+                      SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _icaoController,
+                              decoration: InputDecoration(
+                                labelText: 'Extra ICAO (e.g. LCPH)',
+                              ),
+                              textCapitalization: TextCapitalization.characters,
+                            ),
+                          ),
+                          ElevatedButton(
+                            onPressed: fetchExtraMetarTaf,
+                            child: const Text('Get METAR/TAF'),
+                          ),
+                        ],
+                      ),
+                      if (_metarExtra != null)
+                        Text('Extra METAR: $_metarExtra'),
+                      if (_tafExtra != null) Text('Extra TAF: $_tafExtra'),
+                      if (_loadingMetar || _loadingTaf)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 8.0),
+                          child: CircularProgressIndicator(),
+                        ),
+                    ],
+                  ),
                   // --- 4 toggles placed here ---
                   SwitchListTile(
                     title: const Text('Use device location for Origin'),
@@ -4608,13 +4958,28 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                                                   );
                                                 }
 
+                                                // place here: call winds preview and include METAR/TAF
+                                                // place here: print winds exactly like the dialog + include METAR/TAF
                                                 CruiseReportExporter.previewWindsOnly(
+                                                  // simple tailwind maps (kept for compatibility)
                                                   departure: toTailwindMap(
                                                     _departureWindsAloft,
                                                   ),
                                                   destination: toTailwindMap(
                                                     _destinationWindsAloft,
                                                   ),
+                                                  // pass the full profiles so the PDF mirrors the dialog output
+                                                  departureProfile:
+                                                      _departureWindsAloft,
+                                                  destinationProfile:
+                                                      _destinationWindsAloft,
+                                                  // include METAR/TAF (origin, destination, and extra ICAO)
+                                                  originMetar: _metarOrigin,
+                                                  originTaf: _tafOrigin,
+                                                  destMetar: _metarDest,
+                                                  destTaf: _tafDest,
+                                                  extraMetar: _metarExtra,
+                                                  extraTaf: _tafExtra,
                                                 );
                                               },
                                             ),
@@ -4627,6 +4992,33 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                                             ),
                                           ],
                                         ),
+                                      ),
+                                      // METAR/TAF UI section
+                                      Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Origin METAR: ${_metarOrigin ?? "—"}',
+                                          ),
+                                          Text(
+                                            'Origin TAF: ${_tafOrigin ?? "—"}',
+                                          ),
+                                          SizedBox(height: 8),
+                                          Text(
+                                            'Destination METAR: ${_metarDest ?? "—"}',
+                                          ),
+                                          Text(
+                                            'Destination TAF: ${_tafDest ?? "—"}',
+                                          ),
+                                          const SizedBox.shrink(),
+                                          if (_metarExtra != null)
+                                            Text('Extra METAR: $_metarExtra'),
+                                          if (_tafExtra != null)
+                                            Text('Extra TAF: $_tafExtra'),
+                                          if (_loadingMetar || _loadingTaf)
+                                            CircularProgressIndicator(),
+                                        ],
                                       ),
                                     ],
                                   ),
@@ -5604,6 +5996,42 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
   }
 
   Future<void> calculateCruise({bool roundTrip = true}) async {
+    // Prefer ICAO inputs if present: resolve and populate the coordinate controllers
+    // (write decimal coords so parsing/distance code sees valid numbers immediately)
+    if (originIcaoController.text.trim().isNotEmpty) {
+      final latlon = await resolveIcaoToLatLon(originIcaoController.text);
+      if (latlon != null) {
+        // write decimals so _parseCoord() sees finite numbers
+        originLatController.text = latlon.latitude.toStringAsFixed(6);
+        originLonController.text = latlon.longitude.toStringAsFixed(6);
+        // update validation + auto-distance immediately so missionDistance reflects the new coords
+        _validateAndDistance();
+      }
+    }
+    if (destIcaoController.text.trim().isNotEmpty) {
+      final latlon = await resolveIcaoToLatLon(destIcaoController.text);
+      if (latlon != null) {
+        destLatController.text = latlon.latitude.toStringAsFixed(6);
+        destLonController.text = latlon.longitude.toStringAsFixed(6);
+        _validateAndDistance();
+      }
+    }
+
+    // If user provided ICAO(s), fetch METAR/TAF directly from them so UI shows METAR/TAF immediately.
+    // This avoids waiting for the "closest ICAO" fallback used elsewhere.
+    try {
+      final oIcao = originIcaoController.text.trim().toUpperCase();
+      final dIcao = destIcaoController.text.trim().toUpperCase();
+      if (oIcao.length == 4 || dIcao.length == 4) {
+        // if destination ICAO empty, pass origin for the dest param to avoid nulls
+        await fetchOriginDestMetarTaf(
+          oIcao.isNotEmpty ? oIcao : (dIcao.isNotEmpty ? dIcao : ''),
+          dIcao.isNotEmpty ? dIcao : (oIcao.isNotEmpty ? oIcao : ''),
+        );
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('ICAO METAR fetch error: $e');
+    }
     // Parse inputs
     cruiseSpeed = _parseNumber(cruiseSpeedController.text);
     // ensure missionDistance reads from the input field unless auto-calculated later

@@ -2,19 +2,44 @@ import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:aw139_cruise/export/cruise_report_export.dart'; // <-- add this line
+import 'package:aw139_cruise/export/cruise_report_export.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
 import 'package:flutter/services.dart'
     show rootBundle, Clipboard, ClipboardData;
 import 'package:aw139_cruise/export/route_export_kml.dart';
-import 'dart:convert' show utf8, jsonDecode, JsonEncoder, jsonEncode;
 import 'dart:typed_data' show Uint8List;
 import 'package:file_selector/file_selector.dart';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'dart:async';
-import 'dart:convert';
+import 'dart:io' show File;
+import 'dart:convert'
+    show HtmlEscape, jsonDecode, jsonEncode, JsonEncoder, utf8;
+import 'package:xml/xml.dart';
+
+// Split a list of LatLng into segments, breaking at long jumps
+List<List<LatLng>> splitByLongJumps(
+  List<LatLng> pts,
+  double maxDistanceMeters,
+) {
+  if (pts.length < 2) return [];
+  final result = <List<LatLng>>[];
+  var current = <LatLng>[pts.first];
+  for (int i = 1; i < pts.length; i++) {
+    final prev = current.last;
+    final curr = pts[i];
+    final dist = Distance().as(LengthUnit.Meter, prev, curr);
+    if (dist < maxDistanceMeters) {
+      current.add(curr);
+    } else {
+      if (current.length > 1) result.add(current);
+      current = [curr];
+    }
+  }
+  if (current.length > 1) result.add(current);
+  return result;
+}
 
 // Windy API key (keep private). Replace YOUR_REAL_WINDY_KEY with your key.
 const String kWindyApiKey = 'a4wqVgw3RBBPbjA0PjMtmD1I9PK0ndAX';
@@ -1066,8 +1091,35 @@ class CruiseInputScreen extends StatefulWidget {
 
 class CruiseInputScreenState extends State<CruiseInputScreen>
     with SingleTickerProviderStateMixin {
+  // Downsample a list by step
+  List<LatLng> downsample(List<LatLng> pts, int step) {
+    if (pts.length <= step) return pts;
+    final result = <LatLng>[];
+    for (int i = 0; i < pts.length; i += step) {
+      result.add(pts[i]);
+    }
+    if (result.last != pts.last) result.add(pts.last);
+    return result;
+  }
+
+  // Remove lines that are too long (e.g., >1km)
+  List<LatLng> filterLongJumps(List<LatLng> pts, double maxDistanceMeters) {
+    if (pts.length < 2) return pts;
+    final filtered = <LatLng>[pts.first];
+    for (int i = 1; i < pts.length; i++) {
+      final prev = filtered.last;
+      final curr = pts[i];
+      final dist = Distance().as(LengthUnit.Meter, prev, curr);
+      if (dist < maxDistanceMeters) {
+        filtered.add(curr);
+      }
+      // else: skip this point, don't connect
+    }
+    return filtered;
+  }
+
   // Core numeric state
-  double cruiseSpeed = 130;
+  double cruiseSpeed = 130; // Default cruise speed
   double missionDistance = 100;
   double altitude = 2000;
   double temperature = 20;
@@ -1110,6 +1162,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
   bool showSarLabels = true;
   bool includeSarInPnr = true;
   bool _headingUp = false;
+  bool _showPowerLines = false;
+  bool _fuelCautionShown = false;
 
   // Flags for optional waypoints
   bool useWaypoint1 = false;
@@ -1125,6 +1179,70 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
     if (!v.isFinite) return v;
     final n = v % 360.0;
     return n < 0 ? n + 360.0 : n;
+  }
+
+  List<LatLng> _powerPolesOrdered = [];
+
+  Future<void> _loadPowerPolesFromAssets() async {
+    try {
+      final kmlString = await rootBundle.loadString(
+        'assets/Power_Lines/Power_Lines.kml',
+      );
+      final doc = XmlDocument.parse(kmlString);
+      final coords = <LatLng>[];
+      for (final c in doc.findAllElements('coordinates')) {
+        final text = c.innerText.trim();
+        for (final line in text.split(RegExp(r'\s+'))) {
+          final parts = line.split(',');
+          if (parts.length >= 2) {
+            final lon = double.tryParse(parts[0]);
+            final lat = double.tryParse(parts[1]);
+            if (lat != null && lon != null) {
+              coords.add(LatLng(lat, lon));
+            }
+          }
+        }
+      }
+      setState(() {
+        _powerPolesOrdered = _greedyOrder(coords);
+      });
+    } catch (e) {
+      setState(() {
+        _powerPolesOrdered = [];
+      });
+    }
+  }
+
+  // Greedy nearest-neighbor ordering
+  List<LatLng> _greedyOrder(List<LatLng> pts) {
+    if (pts.isEmpty) return [];
+    final used = <int>{0};
+    final ordered = [pts[0]];
+    while (used.length < pts.length) {
+      final last = ordered.last;
+      int? nextIdx;
+      double? minDist;
+      for (int i = 0; i < pts.length; i++) {
+        if (used.contains(i)) continue;
+        final d = _gcDistanceNm(
+          last.latitude,
+          last.longitude,
+          pts[i].latitude,
+          pts[i].longitude,
+        );
+        if (minDist == null || d < minDist) {
+          minDist = d;
+          nextIdx = i;
+        }
+      }
+      if (nextIdx != null) {
+        used.add(nextIdx);
+        ordered.add(pts[nextIdx]);
+      } else {
+        break;
+      }
+    }
+    return ordered;
   }
 
   // Paste near the top of your CruiseInputScreenState class (or as a static const outside the class)
@@ -1151,6 +1269,230 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
       }
     }
     return closestIcao;
+  }
+
+  // ...existing code...
+
+  // ...existing code...
+
+  final List<LatLng> _flightTrack = [];
+  bool _recordingTrack = false;
+  DateTime? _trackStartTime;
+  final double _trackMinSeparationNm = 0.01;
+
+  void _addTrackPointIfNeeded(LatLng p) {
+    if (!p.latitude.isFinite || !p.longitude.isFinite) return;
+    if (_flightTrack.isEmpty) {
+      _flightTrack.add(p);
+      return;
+    }
+    final last = _flightTrack.last;
+    final d = _gcDistanceNm(
+      last.latitude,
+      last.longitude,
+      p.latitude,
+      p.longitude,
+    );
+    if (d >= _trackMinSeparationNm) {
+      _flightTrack.add(p);
+    }
+  }
+
+  void _startTrackRecording() {
+    _flightTrack.clear();
+    if (_aircraftPosition != null) _flightTrack.add(_aircraftPosition!);
+    _trackStartTime = DateTime.now();
+    setState(() => _recordingTrack = true);
+  }
+
+  void _stopTrackRecording() {
+    setState(() => _recordingTrack = false);
+  }
+
+  void _clearTrack() {
+    setState(() {
+      _flightTrack.clear();
+      _trackStartTime = null;
+    });
+  }
+
+  String _generateKmlString(List<LatLng> pts, {String name = 'Track'}) {
+    final buffer = StringBuffer();
+    buffer.writeln('<?xml version="1.0" encoding="UTF-8"?>');
+    buffer.writeln('<kml xmlns="http://www.opengis.net/kml/2.2">');
+    buffer.writeln('<Document>');
+    buffer.writeln('<name>${HtmlEscape().convert(name)}</name>');
+    buffer.writeln('<Placemark>');
+    buffer.writeln('<name>${HtmlEscape().convert(name)}</name>');
+    buffer.writeln('<LineString>');
+    buffer.writeln('<tessellate>1</tessellate>');
+    buffer.writeln('<coordinates>');
+    for (final p in pts) {
+      buffer.writeln(
+        '${p.longitude.toStringAsFixed(6)},${p.latitude.toStringAsFixed(6)},0',
+      );
+    }
+    buffer.writeln('</coordinates>');
+    buffer.writeln('</LineString>');
+    buffer.writeln('</Placemark>');
+    buffer.writeln('</Document>');
+    buffer.writeln('</kml>');
+    return buffer.toString();
+  }
+
+  String _generateGpxString(List<LatLng> pts, {String name = 'Track'}) {
+    final buffer = StringBuffer();
+    buffer.writeln('<?xml version="1.0" encoding="UTF-8"?>');
+    buffer.writeln(
+      '<gpx version="1.1" creator="AW139 Cruise" xmlns="http://www.topografix.com/GPX/1/1">',
+    );
+    buffer.writeln('<trk>');
+    buffer.writeln('<name>${_escapeXml(name)}</name>');
+    buffer.writeln('<trkseg>');
+    for (final p in pts) {
+      buffer.writeln(
+        '  <trkpt lat="${p.latitude.toStringAsFixed(6)}" lon="${p.longitude.toStringAsFixed(6)}"><ele>0</ele></trkpt>',
+      );
+    }
+    buffer.writeln('</trkseg>');
+    buffer.writeln('</trk>');
+    buffer.writeln('</gpx>');
+    return buffer.toString();
+  }
+
+  String _escapeXml(String s) {
+    return s
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+  }
+
+  Future<void> _saveTrackAsKml() async {
+    if (_flightTrack.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('No track to export')));
+      return;
+    }
+
+    final suggested =
+        'flight_track_${_trackStartTime?.toIso8601String().replaceAll(':', '-') ?? DateTime.now().toIso8601String()}.kml';
+    try {
+      final saveLocation = await getSaveLocation(
+        suggestedName: suggested,
+        acceptedTypeGroups: const [
+          XTypeGroup(label: 'KML', extensions: ['kml']),
+        ],
+      );
+      if (saveLocation == null) return;
+      final kml = _generateKmlString(_flightTrack, name: 'Flight Track');
+      if (kIsWeb) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Export on web is not supported by file selector.'),
+          ),
+        );
+        return;
+      }
+      final f = File(saveLocation.path);
+      await f.writeAsString(kml);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('KML saved')));
+    } catch (e) {
+      if (kDebugMode) debugPrint('Error saving KML: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Error saving KML: $e')));
+    }
+  }
+
+  Future<void> _saveTrackAsGpx() async {
+    if (_flightTrack.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('No track to export')));
+      return;
+    }
+
+    final suggested =
+        'flight_track_${_trackStartTime?.toIso8601String().replaceAll(':', '-') ?? DateTime.now().toIso8601String()}.gpx';
+    try {
+      final saveLocation = await getSaveLocation(
+        suggestedName: suggested,
+        acceptedTypeGroups: const [
+          XTypeGroup(label: 'GPX', extensions: ['gpx']),
+        ],
+      );
+      if (saveLocation == null) return;
+      final gpx = _generateGpxString(_flightTrack, name: 'Flight Track');
+      if (kIsWeb) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Export on web is not supported by file selector.'),
+          ),
+        );
+        return;
+      }
+      final f = File(saveLocation.path);
+      await f.writeAsString(gpx);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('GPX saved')));
+    } catch (e) {
+      if (kDebugMode) debugPrint('Error saving GPX: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Error saving GPX: $e')));
+    }
+  }
+
+  // Track controls widget
+  Widget _buildTrackControls() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          tooltip: _recordingTrack ? 'Stop recording' : 'Start recording',
+          icon: Icon(
+            _recordingTrack
+                ? Icons.fiber_manual_record
+                : Icons.radio_button_unchecked,
+            color: _recordingTrack ? Colors.red : Colors.white,
+          ),
+          onPressed: () {
+            if (_recordingTrack) {
+              _stopTrackRecording();
+            } else {
+              _startTrackRecording();
+            }
+          },
+        ),
+        IconButton(
+          tooltip: 'Save KML',
+          icon: const Icon(Icons.save_alt, color: Colors.white),
+          onPressed: _flightTrack.isNotEmpty ? _saveTrackAsKml : null,
+        ),
+        IconButton(
+          tooltip: 'Save GPX',
+          icon: const Icon(Icons.save, color: Colors.white),
+          onPressed: _flightTrack.isNotEmpty ? _saveTrackAsGpx : null,
+        ),
+        IconButton(
+          tooltip: 'Clear track',
+          icon: const Icon(Icons.delete_forever, color: Colors.white),
+          onPressed: _flightTrack.isNotEmpty ? _clearTrack : null,
+        ),
+      ],
+    );
   }
 
   Future<String?> fetchMetarRaw(String icao) async {
@@ -1296,13 +1638,13 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
   // --- METAR/TAF state and fetch logic ---
   final TextEditingController _icaoController = TextEditingController();
 
-  // Returns LatLng or null if not found.
-  // Looks up in cached airport asset; supports multiple geojson files.
+  /// Resolves an ICAO code to LatLng by searching all airport GeoJSON assets.
+  /// Returns null if not found. Caches results for fast repeated lookups.
   Future<LatLng?> resolveIcaoToLatLon(String icao) async {
     final key = icao.trim().toUpperCase();
     if (key.isEmpty) return null;
 
-    // load/cache mapping once
+    // Build cache only once
     if (_airportIcaoCache == null) {
       _airportIcaoCache = {};
       final files = [
@@ -1325,27 +1667,40 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                           props['ident'] ??
                           props['icao'] ??
                           props['icao_code'])
-                      ?.toString();
+                      ?.toString()
+                      .trim()
+                      .toUpperCase();
               final geom = f['geometry'] as Map<String, dynamic>?;
               if (id == null || geom == null) continue;
               final coords = (geom['coordinates'] as List<dynamic>?);
               if (coords == null || coords.length < 2) continue;
               final lon = (coords[0] as num).toDouble();
               final lat = (coords[1] as num).toDouble();
-              _airportIcaoCache![id.toUpperCase()] = LatLng(lat, lon);
-            } catch (_) {
-              // skip malformed feature
+              _airportIcaoCache![id] = LatLng(lat, lon);
+            } catch (e) {
+              if (kDebugMode) {
+                debugPrint('Malformed feature in $file: $e');
+              }
               continue;
             }
           }
         } catch (e) {
-          if (kDebugMode) debugPrint('resolveIcaoToLatLon load error: $e');
-          continue;
+          if (kDebugMode) {
+            debugPrint('resolveIcaoToLatLon load error ($file): $e');
+            continue;
+          }
         }
+      }
+      if (kDebugMode) {
+        debugPrint('Airport ICAO cache built: ${_airportIcaoCache!.keys}');
       }
     }
 
-    return _airportIcaoCache![key];
+    final result = _airportIcaoCache![key];
+    if (kDebugMode) {
+      debugPrint('resolveIcaoToLatLon($key) => $result');
+    }
+    return result;
   }
 
   String? _metarOrigin, _tafOrigin;
@@ -1459,6 +1814,9 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
         _aircraftPosition = LatLng(pos.latitude, pos.longitude);
         _aircraftHeading = pos.heading.isFinite ? pos.heading : 0.0;
       });
+      if (_recordingTrack && _aircraftPosition != null) {
+        _addTrackPointIfNeeded(_aircraftPosition!);
+      }
       if (_autoCenterEnabled && _aircraftPosition != null) {
         _mapController.move(_aircraftPosition!, _mapController.camera.zoom);
       }
@@ -1839,7 +2197,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
   final _navOutLatController = TextEditingController();
   final _navOutLonController = TextEditingController();
   // "Custom lat/lon…" option for the Nav tool dropdown
-  static const int _customBaseIndex = -1;
+  final int _customBaseIndex = -1;
   // Controllers for custom base coordinates (shown when _customBaseIndex selected)
   final _navBaseLatController = TextEditingController();
   final _navBaseLonController = TextEditingController();
@@ -1954,13 +2312,13 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
 
   // Aircraft selection (default AW139). Add 'Bell 412' when you upload tables.
   String _selectedAircraft = 'AW139';
-  static const List<String> kAircraftOptions = ['AW139', 'Bell 412'];
+  final List<String> kAircraftOptions = ['AW139', 'Bell 412'];
 
   // Wind provider selection
   WindProvider _windProvider = kWindyApiKey.isNotEmpty
       ? WindProvider.windy
       : WindProvider.openMeteo;
-  static const Map<WindProvider, String> _windProviderNames = {
+  final Map<WindProvider, String> _windProviderNames = {
     WindProvider.windy: 'Windy',
     WindProvider.openMeteo: 'Open‑Meteo',
   };
@@ -2286,6 +2644,8 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
   @override
   void initState() {
     super.initState();
+    _loadPowerPolesFromAssets();
+
     // load BH412 performance table (safe to call even if asset missing)
     loadBh412TablesFromAsset();
 
@@ -2385,7 +2745,59 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
     }
   }
 
-  void _validateAndDistance() {
+  Future<void> _validateAndDistance() async {
+    // --- AW139 fuel safety checks (blocking dialogs) ---
+    if (_selectedAircraft == 'AW139') {
+      final raw = fuelController.text.trim();
+      final parsed = double.tryParse(raw) ?? 0.0;
+      // Hard maximum: clamp to 1600 kg and require acknowledgement
+      if (parsed > 1600.0) {
+        fuelController.text = '1600';
+        try {
+          fuelOnboard = 1600;
+        } catch (_) {}
+        if (context.mounted && !_fuelCautionShown) {
+          _fuelCautionShown = true;
+          await showDialog<void>(
+            context: context,
+            builder: (c) => AlertDialog(
+              title: const Text('Fuel limit exceeded'),
+              content: const Text(
+                'AW139 maximum fuel is 1600 kg. The value has been set to 1600 kg.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(c).pop(),
+                  child: const Text('OK'),
+                ),
+              ],
+            ),
+          );
+        }
+        return;
+      } else if (parsed > 1200.0) {
+        if (context.mounted && !_fuelCautionShown) {
+          _fuelCautionShown = true;
+          await showDialog<void>(
+            context: context,
+            builder: (c) => AlertDialog(
+              title: const Text('Extra tank required'),
+              content: const Text(
+                'AW139 fuel above 1200 kg requires an extra tank. Press OK to continue.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(c).pop(),
+                  child: const Text('OK'),
+                ),
+              ],
+            ),
+          );
+        }
+        // continue on after acknowledgement
+      }
+    }
+
     String? valErr(double v, bool isLat, String raw) {
       if (raw.trim().isEmpty) return null;
       if (!v.isFinite) return 'Invalid';
@@ -3184,8 +3596,7 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
               }
               Navigator.of(context).pop();
             },
-          ),
-          // Add more toggles here as you add features!
+          ), // Add more toggles here as you add features!
         ],
       ),
       actions: [
@@ -3434,6 +3845,19 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                         ),
                     ],
                   ),
+                  const SizedBox(height: 16),
+                  // Flight track recording controls
+                  Text(
+                    'Flight Track Recording',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  _buildTrackControls(),
+                  const SizedBox(height: 16),
                   // --- 4 toggles placed here ---
                   SwitchListTile(
                     title: const Text('Use device location for Origin'),
@@ -3519,6 +3943,30 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                   ),
+                  if (showMap)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8.0),
+                      child: ElevatedButton.icon(
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('Reload Power Poles from Asset'),
+                        onPressed: _loadPowerPolesFromAssets,
+                      ),
+                    ),
+                  SwitchListTile(
+                    title: const Text('Show Power Lines'),
+                    value: _showPowerLines,
+                    onChanged: (v) async {
+                      setState(() => _showPowerLines = v);
+                      if (v && _powerPolesOrdered.isEmpty) {
+                        await _loadPowerPolesFromAssets();
+                        setState(() {}); // Refresh after loading
+                      }
+                    },
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+
+                  // ...existing code...
                   SwitchListTile(
                     title: const Text('Create waypoint from radial/distance'),
                     value: showNavTool,
@@ -3984,6 +4432,43 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                                         ),
                                     ],
                                   ),
+                                  // Power poles from KML asset (now only shown if toggle is on)
+                                  if (_showPowerLines &&
+                                      _powerPolesOrdered.isNotEmpty)
+                                    PolylineLayer(
+                                      polylines: [
+                                        for (final segment in splitByLongJumps(
+                                          downsample(_powerPolesOrdered, 3),
+                                          2414, // 1.5 miles in meters
+                                        ))
+                                          Polyline(
+                                            points: segment,
+                                            strokeWidth: 3.0,
+                                            color: Colors.red,
+                                          ),
+                                      ],
+                                    ),
+                                  if (_showPowerLines &&
+                                      _powerPolesOrdered.isNotEmpty)
+                                    MarkerLayer(
+                                      markers: [
+                                        for (final p in downsample(
+                                          _powerPolesOrdered,
+                                          3,
+                                        ))
+                                          Marker(
+                                            point: p,
+                                            width: 10,
+                                            height: 10,
+                                            child: Container(
+                                              decoration: const BoxDecoration(
+                                                color: Colors.red,
+                                                shape: BoxShape.circle,
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
                                 ],
                               );
                               if (_headingUp && _aircraftHeading.isFinite) {
@@ -4196,6 +4681,55 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                                                                       .white,
                                                                 ),
                                                               ),
+                                                              if (_showPowerLines &&
+                                                                  _powerPolesOrdered
+                                                                      .isNotEmpty)
+                                                                PolylineLayer(
+                                                                  polylines: [
+                                                                    for (final segment
+                                                                        in splitByLongJumps(
+                                                                          downsample(
+                                                                            _powerPolesOrdered,
+                                                                            3,
+                                                                          ),
+                                                                          2414,
+                                                                        ))
+                                                                      Polyline(
+                                                                        points:
+                                                                            segment,
+                                                                        strokeWidth:
+                                                                            3.0,
+                                                                        color: Colors
+                                                                            .red,
+                                                                      ),
+                                                                  ],
+                                                                ),
+                                                              if (_showPowerLines &&
+                                                                  _powerPolesOrdered
+                                                                      .isNotEmpty)
+                                                                MarkerLayer(
+                                                                  markers:
+                                                                      downsample(
+                                                                            _powerPolesOrdered,
+                                                                            3,
+                                                                          )
+                                                                          .map(
+                                                                            (
+                                                                              p,
+                                                                            ) => Marker(
+                                                                              point: p,
+                                                                              width: 10,
+                                                                              height: 10,
+                                                                              child: Container(
+                                                                                decoration: const BoxDecoration(
+                                                                                  color: Colors.red,
+                                                                                  shape: BoxShape.circle,
+                                                                                ),
+                                                                              ),
+                                                                            ),
+                                                                          )
+                                                                          .toList(),
+                                                                ),
                                                             ],
                                                           );
                                                         }).toList(),

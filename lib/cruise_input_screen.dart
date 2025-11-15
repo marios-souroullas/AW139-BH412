@@ -3710,9 +3710,21 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                     padding: const EdgeInsets.only(top: 6.0),
                     child: TextField(
                       controller: originIcaoController,
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         labelText: 'Origin ICAO (optional)',
                         hintText: 'e.g. LCPH',
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.grey.shade700),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.grey.shade700),
+                        ),
+                        focusedBorder: const OutlineInputBorder(
+                          borderSide: BorderSide(
+                            color: Colors.cyanAccent,
+                            width: 2,
+                          ),
+                        ),
                       ),
                       onChanged: (v) async {
                         final code = v.trim().toUpperCase();
@@ -3757,9 +3769,21 @@ class CruiseInputScreenState extends State<CruiseInputScreen>
                     padding: const EdgeInsets.only(top: 6.0),
                     child: TextField(
                       controller: destIcaoController,
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         labelText: 'Destination ICAO (optional)',
                         hintText: 'e.g. LCPH',
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.grey.shade700),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderSide: BorderSide(color: Colors.grey.shade700),
+                        ),
+                        focusedBorder: const OutlineInputBorder(
+                          borderSide: BorderSide(
+                            color: Colors.cyanAccent,
+                            width: 2,
+                          ),
+                        ),
                       ),
                       onChanged: (v) async {
                         final code = v.trim().toUpperCase();

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live Flight Tracking</title>
+  <style>
+    html, body, #map { height: 100%; margin:0; }
+    #info { position:absolute; top:8px; left:8px; background:#000a; color:#fff; padding:8px; font-family:sans-serif; border-radius:6px; z-index:999; }
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module">
+    // Replace with your Firebase config
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_AUTH_DOMAIN",
+      projectId: "YOUR_PROJECT_ID",
+      storageBucket: "YOUR_BUCKET",
+      messagingSenderId: "YOUR_SENDER_ID",
+      appId: "YOUR_APP_ID"
+    };
+
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getFirestore, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const params = new URLSearchParams(location.search);
+  const session = params.get('session');
+  const tokenParam = params.get('t');
+    if (!session) {
+      document.body.innerHTML = '<h3 style="font-family:sans-serif;padding:12px;">No session id provided</h3>';
+      throw new Error('Missing session');
+    }
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+
+    const map = L.map('map').setView([34.9, 33.6], 8);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{ maxZoom:19 }).addTo(map);
+
+    const trackLayer = L.polyline([], {color:'#00ff66', weight:4}).addTo(map);
+    const marker = L.circleMarker([0,0],{radius:8,color:'#ff8800',fillColor:'#ff8800',fillOpacity:0.9}).addTo(map);
+
+    function decodePolyline(str) {
+      let index = 0, lat = 0, lon = 0, coords = [];
+      while (index < str.length) {
+        let result = 0, shift = 0, b;
+        do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        const dlat = ((result & 1) ? ~(result >> 1) : (result >> 1));
+        lat += dlat;
+        result = 0; shift = 0;
+        do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+        const dlon = ((result & 1) ? ~(result >> 1) : (result >> 1));
+        lon += dlon;
+        coords.push([lat / 1e5, lon / 1e5]);
+      }
+      return coords;
+    }
+
+    const infoDiv = document.getElementById('info');
+
+    onSnapshot(doc(db,'liveSessions',session), (snap)=>{
+      if (!snap.exists()) {
+        infoDiv.innerHTML = 'Session not found';
+        return;
+      }
+      const data = snap.data();
+      if (data.token && tokenParam && data.token !== tokenParam) {
+        infoDiv.innerHTML = 'Invalid token';
+        return;
+      }
+      const last = data.last;
+      if (last) {
+        marker.setLatLng([last.lat, last.lon]);
+        map.panTo([last.lat, last.lon], {animate:true});
+      }
+      if (Array.isArray(data.polylineChunks)) {
+        const pts = [];
+        for (const chunk of data.polylineChunks) {
+          pts.push(...decodePolyline(chunk));
+        }
+        trackLayer.setLatLngs(pts);
+      }
+      infoDiv.innerHTML =
+        `<b>Callsign:</b> ${data.callsign || '-'}<br>`+
+        `<b>Status:</b> ${data.active ? 'Active' : 'Ended'}<br>`+
+        `<b>Last:</b> ${last ? last.lat.toFixed(5)+', '+last.lon.toFixed(5) : '-'}<br>`+
+        `<b>Updated:</b> ${last ? new Date(last.ts).toLocaleTimeString() : '-'}`;
+    });
+  </script>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">Loading…</div>
+</body>
+</html>

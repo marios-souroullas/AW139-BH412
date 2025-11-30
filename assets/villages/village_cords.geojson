@@ -216,7 +216,7 @@
 { "type": "Feature", "properties": { "Field1": "Λέμπα ΠΑΦ", "Field2": "34 48 31", "Field3": "32 24 30" }, "geometry": null },
 { "type": "Feature", "properties": { "Field1": "Λεμύθου ΛΕΜ", "Field2": "34 56 57", "Field3": "32 48 41" }, "geometry": null },
 { "type": "Feature", "properties": { "Field1": "Λεμώνα ΠΑΦ", "Field2": "34 51 47", "Field3": "32 33 26" }, "geometry": null },
-{ "type": "Feature", "properties": { "Field1": "Λεύκα", "Field2": "34 06 48", "Field3": "32 51 04" }, "geometry": null },
+{ "type": "Feature", "properties": { "Field1": "Λεύκα", "Field2": "35 06 48", "Field3": "32 50 58" }, "geometry": null },
 { "type": "Feature", "properties": { "Field1": "Λετύμπου ΠΑΦ", "Field2": "34 51 20", "Field3": "32 30 49" }, "geometry": null },
 { "type": "Feature", "properties": { "Field1": "Λιμνάτης ΛΕΜ", "Field2": "34 48 46", "Field3": "32 56 52" }, "geometry": null },
 { "type": "Feature", "properties": { "Field1": "Λινού ΛΕΥ", "Field2": "35 04 23", "Field3": "32 53 33" }, "geometry": null },

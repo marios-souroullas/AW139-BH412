@@ -1132,139 +1132,168 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
+      isScrollControlled: true,
       builder: (ctx) {
         final legDists = _legDistancesNm();
         return StatefulBuilder(
-          builder: (ctx, setModalState) => Padding(
-            padding: const EdgeInsets.all(12.0),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+          builder: (ctx, setModalState) {
+            return SizedBox(
+              height: MediaQuery.of(ctx).size.height * 0.60,
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Route Manager',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const Spacer(),
-                    IconButton(
-                      icon: const Icon(Icons.close),
-                      onPressed: () => Navigator.of(ctx).pop(),
-                    ),
-                  ],
-                ),
-                if (_routePoints.length < 2)
-                  const Text('Add at least two points to manage the route.'),
-                if (_routePoints.length >= 2)
-                  ReorderableListView(
-                    shrinkWrap: true,
-                    buildDefaultDragHandles: true,
-                    physics: const ClampingScrollPhysics(),
-                    onReorder: (oldIndex, newIndex) {
-                      _reorderRoute(oldIndex, newIndex);
-                      setModalState(() {});
-                    },
-                    children: [
-                      for (int i = 0; i < _routePoints.length; i++)
-                        ListTile(
-                          key: ValueKey('rp_$i'),
-                          dense: true,
-                          title: Text(
-                            'Waypoint ${i + 1}${i < legDists.length ? '  (${legDists[i].toStringAsFixed(1)} nm to next)' : ''}',
-                            style: const TextStyle(color: Colors.white),
-                          ),
-                          subtitle: Text(
-                            '${_toDms(_routePoints[i].latitude, isLat: true)}, ${_toDms(_routePoints[i].longitude, isLat: false)}',
-                            style: const TextStyle(color: Colors.white70),
-                          ),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                tooltip: 'Set active leg start',
-                                icon: Icon(
-                                  Icons.flag,
-                                  color:
-                                      _activeLegIndex == i &&
-                                          i < _routePoints.length - 1
-                                      ? Colors.orangeAccent
-                                      : Colors.white54,
-                                ),
-                                onPressed: i < _routePoints.length - 1
-                                    ? () {
-                                        _setActiveLeg(i);
-                                        setModalState(() {});
-                                      }
-                                    : null,
-                              ),
-                              IconButton(
-                                tooltip: 'Delete',
-                                icon: const Icon(
-                                  Icons.delete_outline,
-                                  color: Colors.redAccent,
-                                ),
-                                onPressed: () {
-                                  setState(() {
-                                    _routePoints.removeAt(i);
-                                    if (_activeLegIndex >=
-                                        _routePoints.length - 1) {
-                                      _activeLegIndex = math.max(
-                                        0,
-                                        _routePoints.length - 2,
-                                      );
-                                    }
-                                  });
-                                  setModalState(() {});
-                                },
-                              ),
-                            ],
+                    Row(
+                      children: [
+                        const Text(
+                          'Route Manager',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
-                    ],
-                  ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    OutlinedButton.icon(
-                      onPressed: _routePoints.isEmpty ? null : _exportRouteJson,
-                      icon: const Icon(Icons.save_alt),
-                      label: const Text('Export JSON'),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close),
+                          onPressed: () => Navigator.of(ctx).pop(),
+                        ),
+                      ],
                     ),
-                    OutlinedButton.icon(
-                      onPressed: _importRouteJson,
-                      icon: const Icon(Icons.folder_open),
-                      label: const Text('Import JSON'),
+                    const SizedBox(height: 6),
+                    if (_routePoints.length < 2)
+                      const Text(
+                        'Add at least two points to manage the route.',
+                      ),
+                    // Make the list area expand and be scrollable while keeping actions pinned
+                    Expanded(
+                      child: _routePoints.length >= 2
+                          ? ReorderableListView(
+                              buildDefaultDragHandles: true,
+                              physics: const ClampingScrollPhysics(),
+                              onReorder: (oldIndex, newIndex) {
+                                _reorderRoute(oldIndex, newIndex);
+                                setModalState(() {});
+                              },
+                              children: [
+                                for (int i = 0; i < _routePoints.length; i++)
+                                  ListTile(
+                                    key: ValueKey('rp_$i'),
+                                    dense: true,
+                                    title: Text(
+                                      'Waypoint ${i + 1}${i < legDists.length ? '  (${legDists[i].toStringAsFixed(1)} nm to next)' : ''}',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                    subtitle: Text(
+                                      '${_toDms(_routePoints[i].latitude, isLat: true)}, ${_toDms(_routePoints[i].longitude, isLat: false)}',
+                                      style: const TextStyle(
+                                        color: Colors.white70,
+                                      ),
+                                    ),
+                                    trailing: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        IconButton(
+                                          tooltip: 'Set active leg start',
+                                          icon: Icon(
+                                            Icons.flag,
+                                            color:
+                                                _activeLegIndex == i &&
+                                                    i < _routePoints.length - 1
+                                                ? Colors.orangeAccent
+                                                : Colors.white54,
+                                          ),
+                                          onPressed: i < _routePoints.length - 1
+                                              ? () {
+                                                  _setActiveLeg(i);
+                                                  setModalState(() {});
+                                                }
+                                              : null,
+                                        ),
+                                        IconButton(
+                                          tooltip: 'Delete',
+                                          icon: const Icon(
+                                            Icons.delete_outline,
+                                            color: Colors.redAccent,
+                                          ),
+                                          onPressed: () {
+                                            setState(() {
+                                              _routePoints.removeAt(i);
+                                              if (_activeLegIndex >=
+                                                  _routePoints.length - 1) {
+                                                _activeLegIndex = math.max(
+                                                  0,
+                                                  _routePoints.length - 2,
+                                                );
+                                              }
+                                            });
+                                            setModalState(() {});
+                                          },
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                              ],
+                            )
+                          : const Center(
+                              child: Text(
+                                'No points',
+                                style: TextStyle(color: Colors.white70),
+                              ),
+                            ),
                     ),
-                    OutlinedButton.icon(
-                      onPressed: _routePoints.isEmpty ? null : _exportRouteGpx,
-                      icon: const Icon(Icons.route),
-                      label: const Text('Export GPX'),
-                    ),
-                    TextButton.icon(
-                      onPressed: _routePoints.isEmpty ? null : _undoRoute,
-                      icon: const Icon(Icons.undo),
-                      label: const Text('Undo'),
-                    ),
-                    TextButton.icon(
-                      onPressed: _routePoints.isEmpty ? null : _clearRoute,
-                      icon: const Icon(Icons.clear),
-                      label: const Text('Clear'),
-                    ),
-                    TextButton(
-                      onPressed: () => Navigator.of(ctx).pop(),
-                      child: const Text('Close'),
+                    const SizedBox(height: 12),
+                    SafeArea(
+                      top: false,
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: _routePoints.isEmpty
+                                ? null
+                                : _exportRouteJson,
+                            icon: const Icon(Icons.save_alt),
+                            label: const Text('Export JSON'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: _importRouteJson,
+                            icon: const Icon(Icons.folder_open),
+                            label: const Text('Import JSON'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: _routePoints.isEmpty
+                                ? null
+                                : _exportRouteGpx,
+                            icon: const Icon(Icons.route),
+                            label: const Text('Export GPX'),
+                          ),
+                          TextButton.icon(
+                            onPressed: _routePoints.isEmpty ? null : _undoRoute,
+                            icon: const Icon(Icons.undo),
+                            label: const Text('Undo'),
+                          ),
+                          TextButton.icon(
+                            onPressed: _routePoints.isEmpty
+                                ? null
+                                : _clearRoute,
+                            icon: const Icon(Icons.clear),
+                            label: const Text('Clear'),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            child: const Text('Close'),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                 ),
-              ],
-            ),
-          ),
+              ),
+            );
+          },
         );
       },
     );

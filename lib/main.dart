@@ -3628,7 +3628,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                             contentPadding: EdgeInsets.zero,
                           ),
                           ExpansionTile(
-                            initiallyExpanded: true,
+                            initiallyExpanded: false,
                             collapsedIconColor: Colors.white70,
                             textColor: Colors.white,
                             iconColor: Colors.white,

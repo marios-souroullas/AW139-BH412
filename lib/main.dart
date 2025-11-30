@@ -1138,7 +1138,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
         return StatefulBuilder(
           builder: (ctx, setModalState) {
             return SizedBox(
-              height: MediaQuery.of(ctx).size.height * 0.60,
+              height: MediaQuery.of(ctx).size.height * 0.75,
               child: Padding(
                 padding: const EdgeInsets.all(12.0),
                 child: Column(
@@ -1247,6 +1247,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                     const SizedBox(height: 12),
                     SafeArea(
                       top: false,
+                      bottom: true,
                       child: Wrap(
                         spacing: 8,
                         runSpacing: 8,

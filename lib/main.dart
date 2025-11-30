@@ -3073,27 +3073,39 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                           icon: const Icon(Icons.search),
                           label: const Text('Search '),
                         ),
-                        TextButton.icon(
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white,
-                          ),
-                          onPressed: () {
+                        // Combined Waypoints/Routes button: opens the same manager.
+                        PopupMenuButton<String>(
+                          color: const Color(0xFF1E1E1E),
+                          onSelected: (sel) {
                             _setOverlayExpanded(false);
-                            _openWaypointsFolder();
+                            if (sel == 'routes') {
+                              _openWaypointsFolder(initialShowRoutes: true);
+                            } else {
+                              _openWaypointsFolder();
+                            }
                           },
-                          icon: const Icon(Icons.folder),
-                          label: const Text('Waypoints'),
-                        ),
-                        TextButton.icon(
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white,
+                          itemBuilder: (_) => [
+                            const PopupMenuItem(
+                              value: 'waypoints',
+                              child: Text('Waypoints'),
+                            ),
+                            const PopupMenuItem(
+                              value: 'routes',
+                              child: Text('Routes'),
+                            ),
+                          ],
+                          child: TextButton.icon(
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.white,
+                            ),
+                            onPressed: () {
+                              // Default action: open Waypoints tab
+                              _setOverlayExpanded(false);
+                              _openWaypointsFolder();
+                            },
+                            icon: const Icon(Icons.folder),
+                            label: const Text('Waypoints & Routes'),
                           ),
-                          onPressed: () {
-                            _setOverlayExpanded(false);
-                            _openWaypointsFolder(initialShowRoutes: true);
-                          },
-                          icon: const Icon(Icons.route),
-                          label: const Text('Routes'),
                         ),
                         TextButton.icon(
                           style: TextButton.styleFrom(
@@ -3602,9 +3614,16 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                             value: _showWaypoints,
                             onChanged: (v) =>
                                 setState(() => _showWaypoints = v),
-                            title: const Text(
-                              'Waypoints',
-                              style: TextStyle(color: Colors.white),
+                            title: InkWell(
+                              onTap: () {
+                                // Open the same Waypoints/Routes manager as the options menu
+                                _setOverlayExpanded(false);
+                                _openWaypointsFolder();
+                              },
+                              child: const Text(
+                                'Waypoints',
+                                style: TextStyle(color: Colors.white),
+                              ),
                             ),
                             contentPadding: EdgeInsets.zero,
                           ),
@@ -8766,11 +8785,24 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   // Helicopter map marker (simple silhouette with heading rotation if track-up enabled)
   Widget _buildHelicopterMarker() {
     final headingRad = _headingUp ? _currentHeadingDeg * math.pi / 180.0 : 0.0;
+    // Increase marker scale in night/NVG for visibility
+    double scale = 1.0;
+    if (_nvgMode) {
+      scale = 1.0 + 0.35 * _nvgIntensity.clamp(0.2, 1.0);
+    } else if (_nightMode) {
+      // Make helicopter larger in night mode for visibility
+      scale = 1.5;
+    }
     return Transform.rotate(
       angle: headingRad,
       child: CustomPaint(
-        size: const Size(42, 42),
-        painter: _HelicopterPainter(),
+        size: Size(42 * scale, 42 * scale),
+        painter: _HelicopterPainter(
+          nightMode: _nightMode,
+          nvgMode: _nvgMode,
+          nvgIntensity: _nvgIntensity,
+          scale: scale,
+        ),
       ),
     );
   }
@@ -14607,25 +14639,68 @@ extension _FlightTimeFormat on _MovingMapScreenState {
 
 // Custom painter for helicopter marker
 class _HelicopterPainter extends CustomPainter {
+  final bool nightMode;
+  final bool nvgMode;
+  final double nvgIntensity;
+  final double scale;
+
+  _HelicopterPainter({
+    this.nightMode = false,
+    this.nvgMode = false,
+    this.nvgIntensity = 1.0,
+    this.scale = 1.0,
+  });
+
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
+
+    // Base colors: change for NVG (bright green) and Night (high-contrast cyan)
+    Color fillColor = Colors.blueAccent;
+    Color strokeColor = Colors.white70;
+    double strokeWidth = 2.0 * (scale);
+
+    if (nvgMode) {
+      // NVG: strong green, brightness depends on intensity
+      final g = (200 + (55 * nvgIntensity)).clamp(0, 255).toInt();
+      fillColor = Color.fromARGB(255, 0, g, 0);
+      strokeColor = Color.fromARGB(255, 160, 255, 160);
+      strokeWidth = 2.5 * (1.0 + 0.6 * nvgIntensity) * scale;
+    } else if (nightMode) {
+      // Night: darker fill with a bright outline and halo to reduce glare but remain visible
+      fillColor = const Color.fromARGB(
+        255,
+        12,
+        30,
+        30,
+      ); // very dark teal/near-black
+      strokeColor = const Color.fromARGB(
+        255,
+        180,
+        255,
+        230,
+      ); // bright cyan outline
+      strokeWidth = 4.2 * scale;
+    }
+
     final bodyPaint = Paint()
-      ..color = Colors.blueAccent
+      ..color = fillColor
       ..style = PaintingStyle.fill;
     final stroke = Paint()
-      ..color = Colors.white70
-      ..strokeWidth = 2
+      ..color = strokeColor
+      ..strokeWidth = strokeWidth
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
-    // Fuselage body
+    // Fuselage body (scaled)
+    final bodyWidth = 14.0 * scale;
+    final bodyHeight = 26.0 * scale;
     final bodyRect = Rect.fromCenter(
-      center: center.translate(0, 4),
-      width: 14,
-      height: 26,
+      center: center.translate(0, 4 * scale),
+      width: bodyWidth,
+      height: bodyHeight,
     );
-    final rad = Radius.circular(6);
+    final rad = Radius.circular(6 * scale);
     final rrect = RRect.fromRectAndCorners(
       bodyRect,
       topLeft: rad,
@@ -14638,20 +14713,20 @@ class _HelicopterPainter extends CustomPainter {
 
     // Tail boom (triangle)
     final tailPath = ui.Path()
-      ..moveTo(center.dx, bodyRect.top + 2)
-      ..lineTo(center.dx - 3, bodyRect.top - 18)
-      ..lineTo(center.dx + 3, bodyRect.top - 18)
+      ..moveTo(center.dx, bodyRect.top + 2 * scale)
+      ..lineTo(center.dx - 3 * scale, bodyRect.top - 18 * scale)
+      ..lineTo(center.dx + 3 * scale, bodyRect.top - 18 * scale)
       ..close();
     canvas.drawPath(tailPath, bodyPaint);
     canvas.drawPath(tailPath, stroke);
 
     // Rotor ring
-    final rotorCenter = center.translate(0, bodyRect.top - 20);
-    const rotorRadius = 16.0;
+    final rotorCenter = center.translate(0, bodyRect.top - 20 * scale);
+    final rotorRadius = 16.0 * scale;
     final rotorPaint = Paint()
-      ..color = Colors.white54
+      ..color = (nvgMode ? Color.fromARGB(200, 200, 255, 200) : Colors.white54)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2;
+      ..strokeWidth = (1.5 * scale).clamp(1.0, 4.0);
     canvas.drawCircle(rotorCenter, rotorRadius, rotorPaint);
 
     // Rotor blades (cross)
@@ -14668,14 +14743,46 @@ class _HelicopterPainter extends CustomPainter {
 
     // Nose arrow for heading
     final nosePath = ui.Path()
-      ..moveTo(center.dx, bodyRect.bottom + 5)
-      ..lineTo(center.dx - 5, bodyRect.bottom - 2)
-      ..lineTo(center.dx + 5, bodyRect.bottom - 2)
+      ..moveTo(center.dx, bodyRect.bottom + 5 * scale)
+      ..lineTo(center.dx - 5 * scale, bodyRect.bottom - 2 * scale)
+      ..lineTo(center.dx + 5 * scale, bodyRect.bottom - 2 * scale)
       ..close();
     canvas.drawPath(nosePath, bodyPaint);
     canvas.drawPath(nosePath, stroke);
+
+    // Add a stronger glow/halo in NVG/night for extra visibility
+    if (nvgMode || nightMode) {
+      // Glow paint with blur for a soft halo. Night uses brighter cyan/white halo but dark fill.
+      final glowPaint = Paint()
+        ..color = (nvgMode
+            ? Color.fromARGB(
+                (180 * nvgIntensity).toInt().clamp(80, 255),
+                0,
+                220,
+                0,
+              )
+            : const Color.fromARGB(200, 180, 255, 230))
+        ..style = PaintingStyle.fill
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, 10.0 * scale);
+      canvas.drawCircle(center, (rotorRadius + 9 * scale), glowPaint);
+
+      // Outer halo ring (bright rim) to separate from background — higher alpha for night mode
+      final halo = Paint()
+        ..color = (nvgMode
+            ? Colors.white.withAlpha(80)
+            : Colors.white.withAlpha(180))
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = (3.0 * scale).clamp(1.0, 8.0)
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, 5.0 * scale);
+      canvas.drawCircle(center, (rotorRadius + 13 * scale), halo);
+    }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _HelicopterPainter oldDelegate) {
+    return oldDelegate.nightMode != nightMode ||
+        oldDelegate.nvgMode != nvgMode ||
+        (oldDelegate.nvgIntensity - nvgIntensity).abs() > 0.001 ||
+        (oldDelegate.scale - scale).abs() > 0.001;
+  }
 }

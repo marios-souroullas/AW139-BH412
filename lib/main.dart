@@ -486,9 +486,101 @@ enum _AltSource { gps, baro }
 enum _NvgStyle { full, uiOnly }
 
 class _MovingMapScreenState extends State<MovingMapScreen> {
+  // Map overlay toggles (persist later if needed)
+  bool _showHeadingArrow = true;
+  bool _showRunwayExtensions = false;
   // Map overlay toggles
   bool _showHeadingArrow = true;
   bool _showRunwayExtensions = false;
+  void _openMapOverlays() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: false,
+      backgroundColor: Colors.black87,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: const [
+                    Icon(Icons.layers, color: Colors.white, size: 18),
+                    SizedBox(width: 8),
+                    Text(
+                      'Map Overlays',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  value: _showHeadingArrow,
+                  onChanged: (v) => setState(() => _showHeadingArrow = v),
+                  title: const Text(
+                    'Heading Arrow',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  subtitle: const Text(
+                    'Short yellow nose line for immediate orientation',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                  thumbColor: const MaterialStatePropertyAll(
+                    Colors.yellowAccent,
+                  ),
+                  trackColor: MaterialStateProperty.resolveWith(
+                    (states) => Colors.yellowAccent.withValues(alpha: 0.3),
+                  ),
+                ),
+                SwitchListTile(
+                  value: _showRunwayExtensions,
+                  onChanged: (v) => setState(() => _showRunwayExtensions = v),
+                  title: const Text(
+                    'Runway Extended Lines',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  subtitle: const Text(
+                    'Show runway extension lines and identifiers',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                  thumbColor: const MaterialStatePropertyAll(
+                    Colors.lightBlueAccent,
+                  ),
+                  trackColor: MaterialStateProperty.resolveWith(
+                    (states) => Colors.lightBlueAccent.withValues(alpha: 0.3),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    icon: const Icon(Icons.check, size: 18),
+                    label: const Text('Done'),
+                    style: TextButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: Colors.black,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   // Utility to parse stored AARRGGBB hex colors for areas
   Color _colorFromHex(String hex) {
     final cleaned = hex.trim().replaceAll('#', '');
@@ -8245,7 +8337,9 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                     ],
                   ),
                 // Immediate heading arrow (short nose line) for orientation
-                if (_showHeadingArrow && _currentPosition != null && _currentHeadingDeg != null)
+                if (_showHeadingArrow &&
+                    _currentPosition != null &&
+                    _currentHeadingDeg != null)
                   PolylineLayer(
                     polylines: () {
                       final hs = _currentHeadingDeg!;
@@ -8795,7 +8889,103 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(horizontal: 10),
                 ),
-                onPressed: _openMapOverlays,
+                onPressed: () {
+                  showModalBottomSheet(
+                    context: context,
+                    isScrollControlled: false,
+                    backgroundColor: Colors.black87,
+                    shape: const RoundedRectangleBorder(
+                      borderRadius:
+                          BorderRadius.vertical(top: Radius.circular(16)),
+                    ),
+                    builder: (ctx) {
+                      return SafeArea(
+                        top: false,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: const [
+                                  Icon(Icons.layers,
+                                      color: Colors.white, size: 18),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    'Map Overlays',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                              SwitchListTile(
+                                value: _showHeadingArrow,
+                                onChanged: (v) => setState(
+                                  () => _showHeadingArrow = v,
+                                ),
+                                title: const Text('Heading Arrow',
+                                    style: TextStyle(color: Colors.white)),
+                                subtitle: const Text(
+                                  'Short yellow nose line for immediate orientation',
+                                  style: TextStyle(color: Colors.white70),
+                                ),
+                                thumbColor: const MaterialStatePropertyAll(
+                                  Colors.yellowAccent,
+                                ),
+                                trackColor:
+                                    MaterialStateProperty.resolveWith(
+                                  (states) =>
+                                      Colors.yellowAccent.withValues(alpha: 0.3),
+                                ),
+                              ),
+                              SwitchListTile(
+                                value: _showRunwayExtensions,
+                                onChanged: (v) => setState(
+                                  () => _showRunwayExtensions = v,
+                                ),
+                                title: const Text('Runway Extended Lines',
+                                    style: TextStyle(color: Colors.white)),
+                                subtitle: const Text(
+                                  'Show runway extension lines and identifiers',
+                                  style: TextStyle(color: Colors.white70),
+                                ),
+                                thumbColor: const MaterialStatePropertyAll(
+                                  Colors.lightBlueAccent,
+                                ),
+                                trackColor:
+                                    MaterialStateProperty.resolveWith(
+                                  (states) => Colors.lightBlueAccent
+                                      .withValues(alpha: 0.3),
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: TextButton.icon(
+                                  onPressed: () => Navigator.of(ctx).pop(),
+                                  icon: const Icon(Icons.check, size: 18),
+                                  label: const Text('Done'),
+                                  style: TextButton.styleFrom(
+                                    backgroundColor: Colors.white,
+                                    foregroundColor: Colors.black,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
                 icon: const Icon(Icons.layers, size: 18),
                 label: const Text('Map Overlays'),
               ),
@@ -14746,68 +14936,84 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   }
 }
 
-  void _openMapOverlays() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: false,
-      backgroundColor: Colors.black87,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) {
-        return SafeArea(
-          top: false,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: const [
-                    Icon(Icons.layers, color: Colors.white, size: 18),
-                    SizedBox(width: 8),
-                    Text(
-                      'Map Overlays',
-                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                SwitchListTile(
-                  value: _showHeadingArrow,
-                  onChanged: (v) => setState(() => _showHeadingArrow = v),
-                  title: const Text('Heading Arrow', style: TextStyle(color: Colors.white)),
-                  subtitle: const Text('Short yellow nose line for immediate orientation', style: TextStyle(color: Colors.white70)),
-                  activeColor: Colors.yellowAccent,
-                ),
-                SwitchListTile(
-                  value: _showRunwayExtensions,
-                  onChanged: (v) => setState(() => _showRunwayExtensions = v),
-                  title: const Text('Runway Extended Lines', style: TextStyle(color: Colors.white)),
-                  subtitle: const Text('Show runway extension lines and identifiers', style: TextStyle(color: Colors.white70)),
-                  activeColor: Colors.lightBlueAccent,
-                ),
-                const SizedBox(height: 8),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton.icon(
-                    onPressed: () => Navigator.of(ctx).pop(),
-                    icon: const Icon(Icons.check, size: 18),
-                    label: const Text('Done'),
-                    style: TextButton.styleFrom(
-                      backgroundColor: Colors.white,
-                      foregroundColor: Colors.black,
+void _openMapOverlays() {
+  showModalBottomSheet(
+    context: context,
+    isScrollControlled: false,
+    backgroundColor: Colors.black87,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+    ),
+    builder: (ctx) {
+      return SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: const [
+                  Icon(Icons.layers, color: Colors.white, size: 18),
+                  SizedBox(width: 8),
+                  Text(
+                    'Map Overlays',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
                     ),
                   ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              SwitchListTile(
+                value: _showHeadingArrow,
+                onChanged: (v) => setState(() => _showHeadingArrow = v),
+                title: const Text(
+                  'Heading Arrow',
+                  style: TextStyle(color: Colors.white),
                 ),
-              ],
-            ),
+                subtitle: const Text(
+                  'Short yellow nose line for immediate orientation',
+                  style: TextStyle(color: Colors.white70),
+                ),
+                activeColor: Colors.yellowAccent,
+              ),
+              SwitchListTile(
+                value: _showRunwayExtensions,
+                onChanged: (v) => setState(() => _showRunwayExtensions = v),
+                title: const Text(
+                  'Runway Extended Lines',
+                  style: TextStyle(color: Colors.white),
+                ),
+                subtitle: const Text(
+                  'Show runway extension lines and identifiers',
+                  style: TextStyle(color: Colors.white70),
+                ),
+                activeColor: Colors.lightBlueAccent,
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  icon: const Icon(Icons.check, size: 18),
+                  label: const Text('Done'),
+                  style: TextButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    foregroundColor: Colors.black,
+                  ),
+                ),
+              ),
+            ],
           ),
-        );
-      },
-    );
-  }
+        ),
+      );
+    },
+  );
+}
 
 // Small UI helper for the info bar
 class _InfoItem extends StatelessWidget {

@@ -486,6 +486,9 @@ enum _AltSource { gps, baro }
 enum _NvgStyle { full, uiOnly }
 
 class _MovingMapScreenState extends State<MovingMapScreen> {
+  // Map overlay toggles
+  bool _showHeadingArrow = true;
+  bool _showRunwayExtensions = false;
   // Utility to parse stored AARRGGBB hex colors for areas
   Color _colorFromHex(String hex) {
     final cleaned = hex.trim().replaceAll('#', '');
@@ -8223,20 +8226,121 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                         point: _currentPosition!,
                         width: 30,
                         height: 30,
-                        child: ColorFiltered(
-                          colorFilter: _nvgMode
-                              ? const ColorFilter.mode(
-                                  Color(0xFF33AA33),
-                                  BlendMode.modulate,
-                                )
-                              : const ColorFilter.mode(
-                                  Colors.transparent,
-                                  BlendMode.dst,
-                                ),
-                          child: _buildHelicopterMarker(),
+                        child: Transform.rotate(
+                          angle: (_currentHeadingDeg ?? 0) * math.pi / 180.0,
+                          child: ColorFiltered(
+                            colorFilter: _nvgMode
+                                ? const ColorFilter.mode(
+                                    Color(0xFF33AA33),
+                                    BlendMode.modulate,
+                                  )
+                                : const ColorFilter.mode(
+                                    Colors.transparent,
+                                    BlendMode.dst,
+                                  ),
+                            child: _buildHelicopterMarker(),
+                          ),
                         ),
                       ),
                     ],
+                  ),
+                // Immediate heading arrow (short nose line) for orientation
+                if (_showHeadingArrow && _currentPosition != null && _currentHeadingDeg != null)
+                  PolylineLayer(
+                    polylines: () {
+                      final hs = _currentHeadingDeg!;
+                      // Short tick ahead of the aircraft nose (~0.2 nm)
+                      final LatLng ahead = _offsetNM(
+                        _currentPosition!,
+                        0.2,
+                        hs,
+                      );
+                      return [
+                        Polyline(
+                          points: [_currentPosition!, ahead],
+                          color: Colors.white.withValues(alpha: 0.65),
+                          strokeWidth: 5.0,
+                        ),
+                        Polyline(
+                          points: [_currentPosition!, ahead],
+                          color: Colors.yellowAccent,
+                          strokeWidth: 3.0,
+                        ),
+                      ];
+                    }(),
+                  ),
+                // Future track guideline: 2, 5, 10 minutes ahead based on current heading and ground speed
+                if (_currentPosition != null &&
+                    _currentGpsSpeedKts != null &&
+                    _currentGpsSpeedKts! > 0)
+                  PolylineLayer(
+                    polylines: () {
+                      // Compute distances ahead (nm) for 2, 5, 10 minutes
+                      final hs = _currentHeadingDeg;
+                      final List<double> mins = [2, 5, 10];
+                      final List<LatLng> pts = [_currentPosition!];
+                      for (final m in mins) {
+                        final nm = _currentGpsSpeedKts! * (m / 60.0);
+                        pts.add(_offsetNM(_currentPosition!, nm, hs));
+                      }
+                      return [
+                        // Outline for visibility
+                        Polyline(
+                          points: pts,
+                          color: Colors.white.withValues(alpha: 0.55),
+                          strokeWidth: 5.0,
+                        ),
+                        Polyline(
+                          points: pts,
+                          color: Colors.lightBlueAccent,
+                          strokeWidth: 3.0,
+                        ),
+                      ];
+                    }(),
+                  ),
+                if (_currentPosition != null &&
+                    _currentGpsSpeedKts != null &&
+                    _currentGpsSpeedKts! > 0)
+                  MarkerLayer(
+                    markers: () {
+                      final hs = _currentHeadingDeg;
+                      final List<double> mins = [2, 5, 10];
+                      final List<Marker> ms = [];
+                      for (final m in mins) {
+                        final nm = _currentGpsSpeedKts! * (m / 60.0);
+                        final p = _offsetNM(_currentPosition!, nm, hs);
+                        ms.add(
+                          Marker(
+                            point: p,
+                            width: 40,
+                            height: 24,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.75),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: Colors.lightBlueAccent,
+                                ),
+                              ),
+                              alignment: Alignment.center,
+                              child: Text(
+                                '${m.toStringAsFixed(0)}m',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      }
+                      return ms;
+                    }(),
                   ),
                 if (_flightStart != null &&
                     _flightEnd == null &&
@@ -8677,6 +8781,23 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                   ),
                   child: _buildOverlayMenu(),
                 ),
+              ),
+            ),
+          ),
+          // Quick access button to Map Overlays subfolder/modal
+          Positioned(
+            top: 56,
+            right: 12,
+            child: SafeArea(
+              child: TextButton.icon(
+                style: TextButton.styleFrom(
+                  backgroundColor: Colors.black87,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                ),
+                onPressed: _openMapOverlays,
+                icon: const Icon(Icons.layers, size: 18),
+                label: const Text('Map Overlays'),
               ),
             ),
           ),
@@ -14624,6 +14745,69 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
     }
   }
 }
+
+  void _openMapOverlays() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: false,
+      backgroundColor: Colors.black87,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: const [
+                    Icon(Icons.layers, color: Colors.white, size: 18),
+                    SizedBox(width: 8),
+                    Text(
+                      'Map Overlays',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  value: _showHeadingArrow,
+                  onChanged: (v) => setState(() => _showHeadingArrow = v),
+                  title: const Text('Heading Arrow', style: TextStyle(color: Colors.white)),
+                  subtitle: const Text('Short yellow nose line for immediate orientation', style: TextStyle(color: Colors.white70)),
+                  activeColor: Colors.yellowAccent,
+                ),
+                SwitchListTile(
+                  value: _showRunwayExtensions,
+                  onChanged: (v) => setState(() => _showRunwayExtensions = v),
+                  title: const Text('Runway Extended Lines', style: TextStyle(color: Colors.white)),
+                  subtitle: const Text('Show runway extension lines and identifiers', style: TextStyle(color: Colors.white70)),
+                  activeColor: Colors.lightBlueAccent,
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    icon: const Icon(Icons.check, size: 18),
+                    label: const Text('Done'),
+                    style: TextButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: Colors.black,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
 
 // Small UI helper for the info bar
 class _InfoItem extends StatelessWidget {

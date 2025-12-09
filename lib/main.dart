@@ -14,7 +14,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'cruise_input_screen.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart' show kDebugMode, debugPrint, kIsWeb;
 import 'dart:convert'
     show jsonDecode, jsonEncode, Utf8Encoder; // include needed converters only
 import 'package:http/http.dart' as http;
@@ -489,9 +489,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   // Map overlay toggles (persist later if needed)
   bool _showHeadingArrow = true;
   bool _showRunwayExtensions = false;
-  // Map overlay toggles
-  bool _showHeadingArrow = true;
-  bool _showRunwayExtensions = false;
+  // ignore: unused_element
   void _openMapOverlays() {
     showModalBottomSheet(
       context: context,
@@ -524,6 +522,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                   ],
                 ),
                 const SizedBox(height: 12),
+                // (Radial/Distance quick tool removed from Map Overlays; now in Layers & Options)
                 SwitchListTile(
                   value: _showHeadingArrow,
                   onChanged: (v) => setState(() => _showHeadingArrow = v),
@@ -535,10 +534,8 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                     'Short yellow nose line for immediate orientation',
                     style: TextStyle(color: Colors.white70),
                   ),
-                  thumbColor: const MaterialStatePropertyAll(
-                    Colors.yellowAccent,
-                  ),
-                  trackColor: MaterialStateProperty.resolveWith(
+                  thumbColor: const WidgetStatePropertyAll(Colors.yellowAccent),
+                  trackColor: WidgetStateProperty.resolveWith(
                     (states) => Colors.yellowAccent.withValues(alpha: 0.3),
                   ),
                 ),
@@ -553,10 +550,10 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                     'Show runway extension lines and identifiers',
                     style: TextStyle(color: Colors.white70),
                   ),
-                  thumbColor: const MaterialStatePropertyAll(
+                  thumbColor: const WidgetStatePropertyAll(
                     Colors.lightBlueAccent,
                   ),
-                  trackColor: MaterialStateProperty.resolveWith(
+                  trackColor: WidgetStateProperty.resolveWith(
                     (states) => Colors.lightBlueAccent.withValues(alpha: 0.3),
                   ),
                 ),
@@ -595,6 +592,8 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   }
 
   final MapController _mapController = MapController();
+  // Global ICAO/Navaid index loaded from assets (airports + navaids)
+  final Map<String, LatLng> _icaoIndex = {};
   // Key for positioning overlays relative to the map Stack
   final GlobalKey _mapStackKey = GlobalKey();
   // Info bar state
@@ -772,6 +771,72 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
     } else {
       _cancelOverlayAutoCloseTimer();
     }
+  }
+
+  Future<void> _loadIcaoIndex() async {
+    try {
+      // Use AssetManifest to discover airport/navaid GeoJSON files
+      final manifestStr = await services.rootBundle.loadString(
+        'AssetManifest.json',
+      );
+      final Map<String, dynamic> manifest =
+          jsonDecode(manifestStr) as Map<String, dynamic>;
+      final keys = manifest.keys.cast<String>();
+      final geojsonPaths = keys.where(
+        (p) =>
+            p.endsWith('.geojson') &&
+            (p.contains('assets/airports') || p.contains('assets/navaids')),
+      );
+      for (final path in geojsonPaths) {
+        try {
+          final dataStr = await services.rootBundle.loadString(path);
+          final data = jsonDecode(dataStr);
+          // Expect GeoJSON FeatureCollection
+          final features = (data is Map && data['features'] is List)
+              ? (data['features'] as List)
+              : const [];
+          for (final f in features) {
+            try {
+              final props = (f is Map && f['properties'] is Map)
+                  ? (f['properties'] as Map)
+                  : const {};
+              final geom = (f is Map && f['geometry'] is Map)
+                  ? (f['geometry'] as Map)
+                  : const {};
+              String? code =
+                  (props['icao'] ??
+                          props['ident'] ??
+                          props['code'] ??
+                          props['name'])
+                      ?.toString();
+              if (code == null || code.isEmpty) continue;
+              code = code.toUpperCase();
+              // geometry: Point [lon, lat]
+              if (geom['type'] == 'Point' && geom['coordinates'] is List) {
+                final coords = (geom['coordinates'] as List);
+                if (coords.length >= 2) {
+                  final lon = (coords[0] as num).toDouble();
+                  final lat = (coords[1] as num).toDouble();
+                  _icaoIndex[code] = LatLng(lat, lon);
+                }
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }
+      // Add a few known manual fallbacks
+      _icaoIndex.putIfAbsent('LCA', () => const LatLng(34.8723, 33.6243));
+      _icaoIndex.putIfAbsent('PHA', () => const LatLng(34.7117, 32.5058));
+      _icaoIndex.putIfAbsent('LCLK', () => const LatLng(34.875, 33.6249));
+      _icaoIndex.putIfAbsent('LCPH', () => const LatLng(34.718, 32.485));
+    } catch (_) {}
+  }
+
+  LatLng? _resolveIcao(String text) {
+    // ignore: unused_element
+    final icao = text.trim().toUpperCase();
+    if (icao.isEmpty) return null;
+    return _icaoIndex[icao];
   }
 
   // Weather toggles
@@ -1131,6 +1196,8 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   // === Route management ===
   final List<LatLng> _routePoints = [];
   int _activeLegIndex = 0; // index of starting waypoint for remaining route
+  // Transient direct-to visualization: index of selected route waypoint
+  int? _directToWaypointIdx;
   double _groundSpeedKts = 120; // user-adjustable groundspeed for ETE
   // Preview-only generated pattern points (dashed overlay)
   List<LatLng> _previewPatternPoints = [];
@@ -1144,6 +1211,48 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   );
   LatLng _offsetNM(LatLng from, double nm, double bearingDeg) =>
       _geo.offset(from, _nmToMeters(nm), bearingDeg);
+
+  // Parse latitude/longitude in decimal or DMS with hemisphere (N/S/E/W)
+  double _parseCoord(String raw, {required bool isLat}) {
+    var s = raw.trim().toUpperCase().replaceAll(',', '.');
+    int sign = 1;
+    if (s.contains('S')) sign = -1;
+    if (s.contains('W')) sign = -1;
+    s = s.replaceAll(RegExp(r"""[NSEW°′’'"″]"""), ' ').trim();
+    final parts = RegExp(r'[-+]?\d+(\.\d+)?')
+        .allMatches(s)
+        .map((m) => double.tryParse(m.group(0) ?? '') ?? 0.0)
+        .toList();
+    double value;
+    if (parts.isEmpty) return double.nan;
+    if (parts.length == 1) {
+      value = parts[0];
+    } else if (parts.length == 2) {
+      value = parts[0] + parts[1] / 60.0;
+    } else {
+      value = parts[0] + parts[1] / 60.0 + parts[2] / 3600.0;
+    }
+    if (RegExp(r'^\s*-').hasMatch(raw)) sign = -1;
+    value *= sign;
+    final maxAbs = isLat ? 90.0 : 180.0;
+    if (value.abs() > maxAbs) return double.nan;
+    return value;
+  }
+
+  // Format decimal degrees to DMS with hemisphere suffix (like cruise)
+  String _formatDms(double deg, {required bool isLat}) {
+    final hemi = (isLat ? (deg >= 0 ? 'N' : 'S') : (deg >= 0 ? 'E' : 'W'));
+    final v = deg.abs();
+    final d = v.floor();
+    final mFloat = (v - d) * 60.0;
+    final m = mFloat.floor();
+    final s = ((mFloat - m) * 60.0);
+    String two(int n) => n.toString().padLeft(2, '0');
+    String secStr = s.toStringAsFixed(2).padLeft(5, '0');
+    return isLat
+        ? '${two(d)}° ${two(m)}′ $secStr″ $hemi'
+        : '${d.toString().padLeft(3, '0')}° ${two(m)}′ $secStr″ $hemi';
+  }
 
   // Compute per-leg distances in nautical miles.
   List<double> _legDistancesNm() {
@@ -1198,6 +1307,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   void _setActiveLeg(int idx) {
     setState(() {
       _activeLegIndex = idx.clamp(0, _routePoints.length - 1);
+      _directToWaypointIdx = _activeLegIndex;
     });
   }
 
@@ -1568,7 +1678,71 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
         context,
       ).showSnackBar(const SnackBar(content: Text('Direct-to set')));
     }
-    _mapController.move(target, 13.0);
+    _mapController.move(target, _mapZoom);
+  }
+
+  // Direct-to a waypoint already in the route without altering remaining waypoints.
+  // Finds the nearest matching index for the given target and sets it active.
+  void _directToExistingWaypoint(LatLng target) {
+    if (_routePoints.isEmpty) return;
+    int idx = _activeLegIndex;
+    double best = double.infinity;
+    for (int i = 0; i < _routePoints.length; i++) {
+      final d = _geo.as(LengthUnit.Meter, _routePoints[i], target);
+      if (d < best) {
+        best = d;
+        idx = i;
+      }
+    }
+    // Truncate route to start from selected waypoint (keep remaining untouched)
+    setState(() {
+      final List<LatLng> newRoute = [];
+      if (_currentPosition != null) {
+        newRoute.add(_currentPosition!);
+      }
+      newRoute.addAll(_routePoints.sublist(idx));
+      _routePoints
+        ..clear()
+        ..addAll(newRoute);
+      _activeLegIndex = 0;
+      _directToWaypointIdx = null; // use normal route polyline visualization
+    });
+    _persistRoute();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Direct-to set from waypoint ${idx + 1}')),
+      );
+    }
+    _mapController.move(_routePoints.first, 13.0);
+  }
+
+  // Direct-To the midpoint of a specific leg, keeping remaining route intact
+  void _directToLegMidpoint(int legIndex) {
+    if (_routePoints.length < 2) return;
+    if (legIndex < 0 || legIndex >= _routePoints.length - 1) return;
+    final a = _routePoints[legIndex];
+    final b = _routePoints[legIndex + 1];
+    final dist = const Distance();
+    final meters = dist.as(LengthUnit.Meter, a, b);
+    if (meters <= 0) return;
+    final mid = LatLng(
+      (a.latitude + b.latitude) / 2,
+      (a.longitude + b.longitude) / 2,
+    );
+    // Insert midpoint between the two waypoints; do not alter other legs
+    setState(() {
+      _routePoints.insert(legIndex + 1, mid);
+      // Set active leg to the segment leading to the new midpoint
+      _activeLegIndex = legIndex;
+      _directToWaypointIdx = null;
+    });
+    _persistRoute();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Inserted midpoint into leg ${legIndex + 1}')),
+      );
+    }
+    _mapController.move(mid, 13.0);
   }
 
   // ===== Search Pattern Generators =====
@@ -2911,7 +3085,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                               ),
                               onPressed: () {
                                 Navigator.of(ctx).pop();
-                                _directTo(p);
+                                _directToExistingWaypoint(p);
                               },
                               icon: const Icon(Icons.navigation),
                               label: const Text('Direct To'),
@@ -3154,6 +3328,477 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                       spacing: 8,
                       runSpacing: 8,
                       children: [
+                        // Radial/Distance tool placed before Imports
+                        TextButton.icon(
+                          style: TextButton.styleFrom(
+                            foregroundColor: Colors.white,
+                          ),
+                          onPressed: () async {
+                            _setOverlayExpanded(false);
+                            final res = await showDialog<LatLng>(
+                              context: context,
+                              builder: (dctx) {
+                                // Cruise-style radial/distance tool embedded in dialog
+                                final fixes = [
+                                  {
+                                    'name': 'Custom lat/lon…',
+                                    'lat': null,
+                                    'lon': null,
+                                  },
+                                  {
+                                    'name': 'Larnaca VOR/DME (LCA)',
+                                    'lat': 34.8723,
+                                    'lon': 33.6243,
+                                  },
+                                  {
+                                    'name': 'Paphos VOR/DME (PHA)',
+                                    'lat': 34.7117,
+                                    'lon': 32.5058,
+                                  },
+                                ];
+                                final radialCtrl = TextEditingController();
+                                final icaoCtrl = TextEditingController();
+                                final distCtrl = TextEditingController();
+                                final baseLatCtrl = TextEditingController();
+                                final baseLonCtrl = TextEditingController();
+                                final outLatCtrl = TextEditingController();
+                                final outLonCtrl = TextEditingController();
+                                int selectedFix = 0;
+                                LatLng? computed;
+                                String? errorMsg;
+                                return StatefulBuilder(
+                                  builder: (ctx, setDlg) {
+                                    LatLng? basePoint() {
+                                      // Prefer ICAO text if provided
+                                      final icao = icaoCtrl.text
+                                          .trim()
+                                          .toUpperCase();
+                                      switch (icao) {
+                                        case 'LCA':
+                                          return const LatLng(
+                                            34.8723,
+                                            33.6243,
+                                          ); // Larnaca VOR/DME
+                                        case 'LCLK':
+                                          return const LatLng(
+                                            34.875,
+                                            33.6249,
+                                          ); // Larnaca Airport (approx)
+                                        case 'PHA':
+                                          return const LatLng(
+                                            34.7117,
+                                            32.5058,
+                                          ); // Paphos VOR/DME
+                                        case 'LCPH':
+                                          return const LatLng(
+                                            34.718,
+                                            32.485,
+                                          ); // Paphos Airport (approx)
+                                      }
+                                      // Fallback: selected fix dropdown
+                                      final f = fixes[selectedFix];
+                                      final lat = f['lat'] as double?;
+                                      final lon = f['lon'] as double?;
+                                      if (lat != null && lon != null) {
+                                        return LatLng(lat, lon);
+                                      }
+                                      final bLat = _parseCoord(
+                                        baseLatCtrl.text,
+                                        isLat: true,
+                                      );
+                                      final bLon = _parseCoord(
+                                        baseLonCtrl.text,
+                                        isLat: false,
+                                      );
+                                      if (bLat.isFinite && bLon.isFinite) {
+                                        return LatLng(bLat, bLon);
+                                      }
+                                      return null;
+                                    }
+
+                                    void compute() {
+                                      final base = basePoint();
+                                      final radial =
+                                          double.tryParse(
+                                            radialCtrl.text.trim(),
+                                          ) ??
+                                          double.nan;
+                                      // Check distance is in NM
+                                      final distRaw = distCtrl.text.trim();
+                                      final distUpper = distRaw.toUpperCase();
+                                      if (RegExp(
+                                            r"[A-Z]",
+                                          ).hasMatch(distUpper) &&
+                                          !distUpper.contains('NM')) {
+                                        setDlg(() {
+                                          errorMsg = 'Distance must be in NM';
+                                        });
+                                        return;
+                                      }
+                                      final distNm =
+                                          double.tryParse(
+                                            distUpper
+                                                .replaceAll('NM', '')
+                                                .trim(),
+                                          ) ??
+                                          double.nan;
+                                      if (base == null ||
+                                          !radial.isFinite ||
+                                          !distNm.isFinite) {
+                                        setDlg(() {
+                                          errorMsg =
+                                              'Enter base, radial and distance';
+                                        });
+                                        return;
+                                      }
+                                      final p = _offsetNM(base, distNm, radial);
+                                      computed = p;
+                                      outLatCtrl.text = _formatDms(
+                                        p.latitude,
+                                        isLat: true,
+                                      );
+                                      outLonCtrl.text = _formatDms(
+                                        p.longitude,
+                                        isLat: false,
+                                      );
+                                      setDlg(() {
+                                        errorMsg = null;
+                                      });
+                                    }
+
+                                    void addToRoute() {
+                                      if (computed == null) compute();
+                                      if (computed == null) return;
+                                      setState(() {
+                                        // Always append as last waypoint
+                                        _routePoints.add(computed!);
+                                      });
+                                      _persistRoute();
+                                      _mapController.move(computed!, _mapZoom);
+                                      Navigator.of(dctx).pop(computed);
+                                    }
+
+                                    void directToPoint() {
+                                      if (computed == null) compute();
+                                      if (computed == null) return;
+                                      Navigator.of(dctx).pop(computed);
+                                    }
+
+                                    return AlertDialog(
+                                      title: const Text(
+                                        'From known fix + radial/distance',
+                                      ),
+                                      content: SingleChildScrollView(
+                                        child: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Row(
+                                              children: [
+                                                Expanded(
+                                                  child: TextField(
+                                                    controller: icaoCtrl,
+                                                    decoration:
+                                                        const InputDecoration(
+                                                          labelText:
+                                                              'ICAO Identifier',
+                                                          hintText:
+                                                              'e.g. LCA, PHA',
+                                                          isDense: true,
+                                                          border:
+                                                              OutlineInputBorder(),
+                                                        ),
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 8),
+                                                SizedBox(
+                                                  width: 90,
+                                                  child: TextField(
+                                                    controller: radialCtrl,
+                                                    decoration:
+                                                        const InputDecoration(
+                                                          labelText: 'Radial',
+                                                          hintText: '0-360',
+                                                          isDense: true,
+                                                          border:
+                                                              OutlineInputBorder(),
+                                                        ),
+                                                    keyboardType:
+                                                        TextInputType.number,
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 8),
+                                                SizedBox(
+                                                  width: 120,
+                                                  child: TextField(
+                                                    controller: distCtrl,
+                                                    decoration:
+                                                        const InputDecoration(
+                                                          labelText:
+                                                              'Distance (NM)',
+                                                          hintText:
+                                                              'e.g. 12 or 12NM',
+                                                          isDense: true,
+                                                          border:
+                                                              OutlineInputBorder(),
+                                                        ),
+                                                    keyboardType:
+                                                        TextInputType.number,
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 8),
+                                                ElevatedButton.icon(
+                                                  onPressed: compute,
+                                                  icon: const Icon(
+                                                    Icons.calculate,
+                                                  ),
+                                                  label: const Text('Compute'),
+                                                ),
+                                              ],
+                                            ),
+                                            if (selectedFix == 0) ...[
+                                              const SizedBox(height: 8),
+                                              Row(
+                                                children: [
+                                                  Expanded(
+                                                    child: TextField(
+                                                      controller: baseLatCtrl,
+                                                      decoration: const InputDecoration(
+                                                        labelText:
+                                                            'Latitude (Base)',
+                                                        hintText:
+                                                            'e.g. 34 52 20 N or 34.8722',
+                                                        isDense: true,
+                                                        border:
+                                                            OutlineInputBorder(),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 8),
+                                                  Expanded(
+                                                    child: TextField(
+                                                      controller: baseLonCtrl,
+                                                      decoration: const InputDecoration(
+                                                        labelText:
+                                                            'Longitude (Base)',
+                                                        hintText:
+                                                            'e.g. 033 37 28 E or 33.6244',
+                                                        isDense: true,
+                                                        border:
+                                                            OutlineInputBorder(),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ],
+                                            const SizedBox(height: 8),
+                                            Row(
+                                              children: [
+                                                Expanded(
+                                                  child: TextField(
+                                                    readOnly: true,
+                                                    controller: outLatCtrl,
+                                                    decoration:
+                                                        const InputDecoration(
+                                                          labelText:
+                                                              'Latitude (DMS)',
+                                                          isDense: true,
+                                                          border:
+                                                              OutlineInputBorder(),
+                                                        ),
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 8),
+                                                Expanded(
+                                                  child: TextField(
+                                                    readOnly: true,
+                                                    controller: outLonCtrl,
+                                                    decoration:
+                                                        const InputDecoration(
+                                                          labelText:
+                                                              'Longitude (DMS)',
+                                                          isDense: true,
+                                                          border:
+                                                              OutlineInputBorder(),
+                                                        ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                            const SizedBox(height: 10),
+                                            if (errorMsg != null) ...[
+                                              Text(
+                                                errorMsg!,
+                                                style: const TextStyle(
+                                                  color: Colors.redAccent,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 6),
+                                            ],
+                                            Row(
+                                              children: [
+                                                OutlinedButton.icon(
+                                                  onPressed: () {
+                                                    if (computed == null) {
+                                                      return;
+                                                    }
+                                                    Clipboard.setData(
+                                                      ClipboardData(
+                                                        text: outLatCtrl.text,
+                                                      ),
+                                                    );
+                                                  },
+                                                  icon: const Icon(Icons.copy),
+                                                  label: const Text('Copy Lat'),
+                                                ),
+                                                const SizedBox(width: 8),
+                                                OutlinedButton.icon(
+                                                  onPressed: () {
+                                                    if (computed == null) {
+                                                      return;
+                                                    }
+                                                    Clipboard.setData(
+                                                      ClipboardData(
+                                                        text: outLonCtrl.text,
+                                                      ),
+                                                    );
+                                                  },
+                                                  icon: const Icon(Icons.copy),
+                                                  label: const Text('Copy Lon'),
+                                                ),
+                                              ],
+                                            ),
+                                            const SizedBox(height: 6),
+                                            Wrap(
+                                              spacing: 8,
+                                              runSpacing: 6,
+                                              children: [
+                                                OutlinedButton.icon(
+                                                  icon: const Icon(
+                                                    Icons.add_location_alt,
+                                                  ),
+                                                  label: const Text(
+                                                    'Add to Route',
+                                                  ),
+                                                  onPressed: addToRoute,
+                                                ),
+                                                OutlinedButton.icon(
+                                                  icon: const Icon(
+                                                    Icons.navigation,
+                                                  ),
+                                                  label: const Text(
+                                                    'Direct To',
+                                                  ),
+                                                  onPressed: directToPoint,
+                                                ),
+                                              ],
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.of(dctx).pop(),
+                                          child: const Text('Close'),
+                                        ),
+                                      ],
+                                    );
+                                  },
+                                );
+                              },
+                            );
+                            if (!mounted) return;
+                            if (res is LatLng) {
+                              await showModalBottomSheet(
+                                context: context,
+                                builder: (bctx) {
+                                  return SafeArea(
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(12.0),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          const Text(
+                                            'Radial/Distance Result',
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            'Lat: ${res.latitude.toStringAsFixed(6)}  Lon: ${res.longitude.toStringAsFixed(6)}',
+                                          ),
+                                          const SizedBox(height: 12),
+                                          Row(
+                                            children: [
+                                              ElevatedButton.icon(
+                                                icon: const Icon(
+                                                  Icons.add_location_alt,
+                                                ),
+                                                label: const Text(
+                                                  'Add to Route',
+                                                ),
+                                                onPressed: () {
+                                                  setState(() {
+                                                    if (_routePoints.isEmpty) {
+                                                      _routePoints.add(res);
+                                                      _activeLegIndex = 0;
+                                                    } else {
+                                                      final insertIdx =
+                                                          (_activeLegIndex >=
+                                                                  0 &&
+                                                              _activeLegIndex <
+                                                                  _routePoints
+                                                                      .length)
+                                                          ? _activeLegIndex + 1
+                                                          : _routePoints.length;
+                                                      _routePoints.insert(
+                                                        insertIdx,
+                                                        res,
+                                                      );
+                                                      _activeLegIndex =
+                                                          insertIdx -
+                                                          1; // keep current leg before the inserted point active
+                                                    }
+                                                  });
+                                                  _persistRoute();
+                                                  Navigator.of(bctx).pop();
+                                                  _mapController.move(
+                                                    res,
+                                                    _mapZoom,
+                                                  );
+                                                },
+                                              ),
+                                              const SizedBox(width: 12),
+                                              ElevatedButton.icon(
+                                                icon: const Icon(
+                                                  Icons.navigation,
+                                                ),
+                                                label: const Text('Direct To'),
+                                                onPressed: () {
+                                                  Navigator.of(bctx).pop();
+                                                  _directTo(res);
+                                                },
+                                              ),
+                                            ],
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                },
+                              );
+                            }
+                          },
+                          icon: const Icon(Icons.straighten),
+                          label: const Text('Radial / Distance…'),
+                        ),
                         TextButton.icon(
                           style: TextButton.styleFrom(
                             foregroundColor: Colors.white,
@@ -3977,26 +4622,88 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
           point: midOffset,
           width: 130,
           height: 34,
-          child: Transform.rotate(
-            angle: angRad,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.75),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFFFF00FF), width: 1.2),
-                boxShadow: const [
-                  BoxShadow(color: Colors.black54, blurRadius: 2),
-                ],
-              ),
-              child: Text(
-                text,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
+          child: GestureDetector(
+            onTap: () async {
+              // Show quick actions: Direct-To next WPT or midpoint
+              await showModalBottomSheet(
+                context: context,
+                backgroundColor: const Color(0xFF1E1E1E),
+                shape: const RoundedRectangleBorder(
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
                 ),
-                textAlign: TextAlign.center,
+                builder: (ctx) {
+                  return SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12.0),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Text(
+                                'Leg ${i + 1} Actions',
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const Spacer(),
+                              IconButton(
+                                icon: const Icon(Icons.close),
+                                onPressed: () => Navigator.of(ctx).pop(),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          ElevatedButton.icon(
+                            icon: const Icon(Icons.navigation),
+                            label: const Text('Direct To next WPT'),
+                            onPressed: () {
+                              Navigator.of(ctx).pop();
+                              _directToExistingWaypoint(_routePoints[i + 1]);
+                            },
+                          ),
+                          const SizedBox(height: 6),
+                          ElevatedButton.icon(
+                            icon: const Icon(Icons.straighten),
+                            label: const Text('Direct To midpoint'),
+                            onPressed: () {
+                              Navigator.of(ctx).pop();
+                              _directToLegMidpoint(i);
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+            child: Transform.rotate(
+              angle: angRad,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.75),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                    color: const Color(0xFFFF00FF),
+                    width: 1.2,
+                  ),
+                  boxShadow: const [
+                    BoxShadow(color: Colors.black54, blurRadius: 2),
+                  ],
+                ),
+                child: Text(
+                  text,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
               ),
             ),
           ),
@@ -4773,18 +5480,32 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
 
   Future<void> _loadPowerLines() async {
     try {
-      // Discover all power line KMLs declared in the Flutter asset manifest
-      final manifestStr = await rootBundle.loadString('AssetManifest.json');
-      final manifest = jsonDecode(manifestStr) as Map<String, dynamic>;
-      final kmlFiles =
-          manifest.keys
-              .where(
-                (k) =>
-                    k.startsWith('assets/Power_Lines/') &&
-                    k.toLowerCase().endsWith('.kml'),
-              )
-              .toList()
-            ..sort();
+      // Discover power line KMLs from the asset manifest (web-safe)
+      List<String> kmlFiles = [];
+      try {
+        String manifestStr;
+        try {
+          manifestStr = await rootBundle.loadString('AssetManifest.json');
+        } catch (_) {
+          manifestStr = await rootBundle.loadString('AssetManifest.bin.json');
+        }
+        final manifest = jsonDecode(manifestStr) as Map<String, dynamic>;
+        kmlFiles =
+            manifest.keys
+                .where(
+                  (k) =>
+                      k.startsWith('assets/Power_Lines/') &&
+                      k.toLowerCase().endsWith('.kml'),
+                )
+                .toList()
+              ..sort();
+      } catch (_) {
+        // Manifest not available (e.g., dev web fetch 404). Fall back to known files.
+        kmlFiles = [
+          'assets/Power_Lines/Power_Lines.kml',
+          'assets/Power_Lines/Power_LinesAddOn.kml',
+        ];
+      }
 
       // Fallback to the original single file if scanning returns nothing
       if (kmlFiles.isEmpty) {
@@ -4875,6 +5596,8 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   void initState() {
     super.initState();
     _loadNvgSettings(); // restore NVG mode + intensity
+    // Build ICAO/Navaid index from assets for manual identifier lookups
+    _loadIcaoIndex();
     // Early permission attempt so dialog appears without needing START press.
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final initial = await Geolocator.checkPermission();
@@ -5561,6 +6284,10 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
   }
 
   Future<void> _recoverActiveFlightIfAny() async {
+    // Path Provider is not supported on web for documents dir; skip recovery on web.
+    if (kIsWeb) {
+      return;
+    }
     if (_recoveredActiveFlight) return; // already handled once
     try {
       final f = await _activeFlightFile();
@@ -8319,7 +9046,7 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                         width: 30,
                         height: 30,
                         child: Transform.rotate(
-                          angle: (_currentHeadingDeg ?? 0) * math.pi / 180.0,
+                          angle: (_currentHeadingDeg) * math.pi / 180.0,
                           child: ColorFiltered(
                             colorFilter: _nvgMode
                                 ? const ColorFilter.mode(
@@ -8337,12 +9064,10 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                     ],
                   ),
                 // Immediate heading arrow (short nose line) for orientation
-                if (_showHeadingArrow &&
-                    _currentPosition != null &&
-                    _currentHeadingDeg != null)
+                if (_showHeadingArrow && _currentPosition != null)
                   PolylineLayer(
                     polylines: () {
-                      final hs = _currentHeadingDeg!;
+                      final hs = _currentHeadingDeg;
                       // Short tick ahead of the aircraft nose (~0.2 nm)
                       final LatLng ahead = _offsetNM(
                         _currentPosition!,
@@ -8478,6 +9203,23 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                       Polyline(
                         points: _routePoints,
                         color: const Color(0xFFFF00FF),
+                        strokeWidth: 4.0,
+                      ),
+                    ],
+                  ),
+                // Direct-to visualization: current position to selected route waypoint
+                if (_directToWaypointIdx != null &&
+                    _currentPosition != null &&
+                    _directToWaypointIdx! >= 0 &&
+                    _directToWaypointIdx! < _routePoints.length)
+                  PolylineLayer(
+                    polylines: [
+                      Polyline(
+                        points: [
+                          _currentPosition!,
+                          _routePoints[_directToWaypointIdx!],
+                        ],
+                        color: Colors.purpleAccent,
                         strokeWidth: 4.0,
                       ),
                     ],
@@ -8895,8 +9637,9 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                     isScrollControlled: false,
                     backgroundColor: Colors.black87,
                     shape: const RoundedRectangleBorder(
-                      borderRadius:
-                          BorderRadius.vertical(top: Radius.circular(16)),
+                      borderRadius: BorderRadius.vertical(
+                        top: Radius.circular(16),
+                      ),
                     ),
                     builder: (ctx) {
                       return SafeArea(
@@ -8912,8 +9655,11 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                             children: [
                               Row(
                                 children: const [
-                                  Icon(Icons.layers,
-                                      color: Colors.white, size: 18),
+                                  Icon(
+                                    Icons.layers,
+                                    color: Colors.white,
+                                    size: 18,
+                                  ),
                                   SizedBox(width: 8),
                                   Text(
                                     'Map Overlays',
@@ -8928,42 +9674,44 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
                               const SizedBox(height: 12),
                               SwitchListTile(
                                 value: _showHeadingArrow,
-                                onChanged: (v) => setState(
-                                  () => _showHeadingArrow = v,
+                                onChanged: (v) =>
+                                    setState(() => _showHeadingArrow = v),
+                                title: const Text(
+                                  'Heading Arrow',
+                                  style: TextStyle(color: Colors.white),
                                 ),
-                                title: const Text('Heading Arrow',
-                                    style: TextStyle(color: Colors.white)),
                                 subtitle: const Text(
                                   'Short yellow nose line for immediate orientation',
                                   style: TextStyle(color: Colors.white70),
                                 ),
-                                thumbColor: const MaterialStatePropertyAll(
+                                thumbColor: const WidgetStatePropertyAll(
                                   Colors.yellowAccent,
                                 ),
-                                trackColor:
-                                    MaterialStateProperty.resolveWith(
-                                  (states) =>
-                                      Colors.yellowAccent.withValues(alpha: 0.3),
+                                trackColor: WidgetStateProperty.resolveWith(
+                                  (states) => Colors.yellowAccent.withValues(
+                                    alpha: 0.3,
+                                  ),
                                 ),
                               ),
                               SwitchListTile(
                                 value: _showRunwayExtensions,
-                                onChanged: (v) => setState(
-                                  () => _showRunwayExtensions = v,
+                                onChanged: (v) =>
+                                    setState(() => _showRunwayExtensions = v),
+                                title: const Text(
+                                  'Runway Extended Lines',
+                                  style: TextStyle(color: Colors.white),
                                 ),
-                                title: const Text('Runway Extended Lines',
-                                    style: TextStyle(color: Colors.white)),
                                 subtitle: const Text(
                                   'Show runway extension lines and identifiers',
                                   style: TextStyle(color: Colors.white70),
                                 ),
-                                thumbColor: const MaterialStatePropertyAll(
+                                thumbColor: const WidgetStatePropertyAll(
                                   Colors.lightBlueAccent,
                                 ),
-                                trackColor:
-                                    MaterialStateProperty.resolveWith(
-                                  (states) => Colors.lightBlueAccent
-                                      .withValues(alpha: 0.3),
+                                trackColor: WidgetStateProperty.resolveWith(
+                                  (states) => Colors.lightBlueAccent.withValues(
+                                    alpha: 0.3,
+                                  ),
                                 ),
                               ),
                               const SizedBox(height: 8),
@@ -14934,85 +15682,6 @@ class _MovingMapScreenState extends State<MovingMapScreen> {
       }
     }
   }
-}
-
-void _openMapOverlays() {
-  showModalBottomSheet(
-    context: context,
-    isScrollControlled: false,
-    backgroundColor: Colors.black87,
-    shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-    ),
-    builder: (ctx) {
-      return SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: const [
-                  Icon(Icons.layers, color: Colors.white, size: 18),
-                  SizedBox(width: 8),
-                  Text(
-                    'Map Overlays',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              SwitchListTile(
-                value: _showHeadingArrow,
-                onChanged: (v) => setState(() => _showHeadingArrow = v),
-                title: const Text(
-                  'Heading Arrow',
-                  style: TextStyle(color: Colors.white),
-                ),
-                subtitle: const Text(
-                  'Short yellow nose line for immediate orientation',
-                  style: TextStyle(color: Colors.white70),
-                ),
-                activeColor: Colors.yellowAccent,
-              ),
-              SwitchListTile(
-                value: _showRunwayExtensions,
-                onChanged: (v) => setState(() => _showRunwayExtensions = v),
-                title: const Text(
-                  'Runway Extended Lines',
-                  style: TextStyle(color: Colors.white),
-                ),
-                subtitle: const Text(
-                  'Show runway extension lines and identifiers',
-                  style: TextStyle(color: Colors.white70),
-                ),
-                activeColor: Colors.lightBlueAccent,
-              ),
-              const SizedBox(height: 8),
-              Align(
-                alignment: Alignment.centerRight,
-                child: TextButton.icon(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  icon: const Icon(Icons.check, size: 18),
-                  label: const Text('Done'),
-                  style: TextButton.styleFrom(
-                    backgroundColor: Colors.white,
-                    foregroundColor: Colors.black,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-    },
-  );
 }
 
 // Small UI helper for the info bar
